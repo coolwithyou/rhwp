@@ -190,6 +190,7 @@ export interface TargetEvidence {
   formatSha256: string;
   adjacentContextSha256: string;
   charShapeId: number;
+  charShapeIds: number[];
   paraShapeId: number;
   styleId: number;
 }
@@ -293,6 +294,57 @@ function replaceWholeFieldTextDeferred(
     deleteCount,
     replacement,
   );
+}
+
+function canRestoreFieldCharShapes(evidence: TargetEvidence, replacementLength: number): boolean {
+  return evidence.charShapeIds.every(id => id === evidence.charShapeId)
+    || evidence.charShapeIds.length === replacementLength;
+}
+
+/** 같은 길이 치환은 글자별 서식 run을 1:1 복원하고, 길이 변경은 단일 서식 셀만 허용한다. */
+function restoreFieldCharShapes(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  replacementLength: number,
+  evidence: TargetEvidence,
+): void {
+  if (replacementLength === 0) return;
+  if (evidence.charShapeIds.length !== replacementLength) {
+    if (!evidence.charShapeIds.every(id => id === evidence.charShapeId)) {
+      throw new DocumentAgentError(
+        'TARGET_FORMAT_MISMATCH',
+        '혼합 글자 서식 셀은 같은 길이의 exact 치환만 지원합니다.',
+      );
+    }
+    wasm.setCharShapeIdInCell(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      target.cellParagraph,
+      0,
+      replacementLength,
+      evidence.charShapeId,
+    );
+    return;
+  }
+  let runStart = 0;
+  while (runStart < replacementLength) {
+    const id = evidence.charShapeIds[runStart]!;
+    let runEnd = runStart + 1;
+    while (runEnd < replacementLength && evidence.charShapeIds[runEnd] === id) runEnd += 1;
+    wasm.setCharShapeIdInCell(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      target.cellParagraph,
+      runStart,
+      runEnd,
+      id,
+    );
+    runStart = runEnd;
+  }
 }
 
 function safeId(value: number | undefined, label: string): number {
@@ -418,6 +470,7 @@ export function collectTargetEvidence(
     })),
     adjacentContextSha256: adjacentContextSha256(wasm, target),
     charShapeId,
+    charShapeIds,
     paraShapeId,
     styleId,
   };
@@ -582,12 +635,9 @@ export function collectFieldTargetEvidence(
   const length = assertFieldTargetCoordinates(wasm, target);
   const charShapeIds = cellCharShapeRuns(wasm, target, length);
   const charShapeId = charShapeIds[0];
-  if (!charShapeIds.every(id => id === charShapeId)) {
-    throw new DocumentAgentError(
-      'TARGET_FORMAT_MISMATCH',
-      '혼합 글자 서식 셀 문단은 에이전트 명령으로 편집할 수 없습니다.',
-    );
-  }
+  const charShape = charShapeIds.every(id => id === charShapeId)
+    ? { kind: 'uniform', id: charShapeId }
+    : { kind: 'runs', ids: charShapeIds };
   const paraShapeId = safeId(wasm.getCellParaPropertiesAt(
     target.section,
     target.parentPara,
@@ -610,7 +660,7 @@ export function collectFieldTargetEvidence(
     textSha256: digestText(text),
     formatSha256: digestText(stableJson({
       schemaVersion: 1,
-      charShapeId,
+      charShape,
       paraShapeId,
       cellProperties: wasm.getCellOwnProperties(
         target.section,
@@ -621,6 +671,7 @@ export function collectFieldTargetEvidence(
     })),
     adjacentContextSha256,
     charShapeId: charShapeId!,
+    charShapeIds,
     paraShapeId,
     styleId: 0,
   };
@@ -1223,6 +1274,13 @@ export class DocumentAgentController {
       throw new DocumentAgentError('TARGET_CONTEXT_MISMATCH', 'field target context SHA가 다릅니다.');
     }
     const beforeNonTarget = beforeEvidence.adjacentContextSha256;
+    const replacementLength = codePointLength(command.replacement);
+    if (!canRestoreFieldCharShapes(beforeEvidence, replacementLength)) {
+      throw new DocumentAgentError(
+        'TARGET_FORMAT_MISMATCH',
+        '혼합 글자 서식 셀은 같은 길이의 exact 치환만 지원합니다.',
+      );
+    }
     this.assertWithinBudget(startedAt);
 
     let afterEvidence!: TargetEvidence;
@@ -1247,19 +1305,8 @@ export class DocumentAgentController {
             if (!result.ok || result.charOffset !== codePointLength(command.replacement)) {
               throw new DocumentAgentError('TRANSACTION_FAILED', 'field target 셀 텍스트를 교체하지 못했습니다.');
             }
-            const afterLength = codePointLength(command.replacement);
-            if (afterLength > 0) {
-              wasm.setCharShapeIdInCell(
-                command.target.section,
-                command.target.parentPara,
-                command.target.controlIndex,
-                command.target.cellIndex,
-                command.target.cellParagraph,
-                0,
-                afterLength,
-                beforeEvidence.charShapeId,
-              );
-            }
+            const afterLength = replacementLength;
+            restoreFieldCharShapes(wasm, command.target, afterLength, beforeEvidence);
             wasm.setCellParaShapeId(
               command.target.section,
               command.target.parentPara,
@@ -1421,18 +1468,7 @@ export class DocumentAgentController {
               throw new DocumentAgentError('TRANSACTION_FAILED', 'field inverse replace가 실패했습니다.');
             }
             const beforeLength = codePointLength(entry.beforeText);
-            if (beforeLength > 0) {
-              wasm.setCharShapeIdInCell(
-                entry.command.target.section,
-                entry.command.target.parentPara,
-                entry.command.target.controlIndex,
-                entry.command.target.cellIndex,
-                entry.command.target.cellParagraph,
-                0,
-                beforeLength,
-                entry.beforeEvidence.charShapeId,
-              );
-            }
+            restoreFieldCharShapes(wasm, entry.command.target, beforeLength, entry.beforeEvidence);
             wasm.setCellParaShapeId(
               entry.command.target.section,
               entry.command.target.parentPara,

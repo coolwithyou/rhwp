@@ -365,6 +365,43 @@ test('field apply/revert는 exact 셀만 한 트랜잭션으로 변경하고 복
   assert.equal((events[1] as { reason: string }).reason, 'field_agent_revert');
 });
 
+test('선택 마커 같은 길이 치환은 혼합 글자 서식을 글자별로 보존하고 revert한다', async () => {
+  const { controller, wasm, input } = harness();
+  wasm.cells[1][0] = cellParagraph('□ 예비창업자 □ 폐업 후 재창업자');
+  const originalShapeIds = Array.from(wasm.cells[1][0].text, (_, index) => index < 8 ? 7 : 9);
+  wasm.cells[1][0].charShapeIds = [...originalShapeIds];
+  const command = fieldCommand(controller, wasm, '■ 예비창업자 □ 폐업 후 재창업자');
+
+  const applied = await controller.applyFieldCommand(command);
+  assert.equal(wasm.cells[1][0].text, '■ 예비창업자 □ 폐업 후 재창업자');
+  assert.deepEqual(wasm.cells[1][0].charShapeIds, originalShapeIds);
+
+  await controller.revertFieldCommand({
+    schemaVersion: 1,
+    commandId: command.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  });
+  assert.equal(wasm.cells[1][0].text, '□ 예비창업자 □ 폐업 후 재창업자');
+  assert.deepEqual(wasm.cells[1][0].charShapeIds, originalShapeIds);
+  assert.equal(input.transactions, 2);
+});
+
+test('혼합 글자 서식 셀의 길이 변경은 mutation 전에 거부한다', async () => {
+  const { controller, wasm, input } = harness();
+  wasm.cells[1][0].charShapeIds[1] = 99;
+  const command = fieldCommand(controller, wasm, '길이가 다른 선택값');
+
+  await assert.rejects(
+    controller.applyFieldCommand(command),
+    (error: unknown) => (error as { code?: string }).code === 'TARGET_FORMAT_MISMATCH',
+  );
+  assert.equal(input.transactions, 0);
+  assert.equal(wasm.cells[1][0].text, '기존 값');
+});
+
 test('apply/revert는 각각 한 트랜잭션·changeSeq 1회·strict receipt로 종결된다', async () => {
   const { controller, wasm, input, events } = harness();
   const command = applyCommand(controller, wasm);
