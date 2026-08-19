@@ -3,27 +3,38 @@ import { resolve } from 'node:path';
 import { runTest, assert } from './helpers.mjs';
 
 const EDITOR_MODULE_PATH = resolve(import.meta.dirname, '../../npm/editor/index.js').replace(/\\/g, '/');
-const EDITOR_MODULE_URL = EDITOR_MODULE_PATH.startsWith('/')
-  ? `/@fs${EDITOR_MODULE_PATH}`
-  : `/@fs/${EDITOR_MODULE_PATH}`;
 const VITE_URL = process.env.VITE_URL || 'http://localhost:7700';
+const STUDIO_URL = process.env.STUDIO_URL || VITE_URL;
+const HARNESS_URL = process.env.HARNESS_URL || `${VITE_URL}/e2e/embed-harness.html`;
+const MODULE_BASE_URL = process.env.MODULE_BASE_URL || VITE_URL;
+const EDITOR_MODULE_URL = EDITOR_MODULE_PATH.startsWith('/')
+  ? `${MODULE_BASE_URL}/@fs${EDITOR_MODULE_PATH}`
+  : `${MODULE_BASE_URL}/@fs/${EDITOR_MODULE_PATH}`;
+const CONTROLLER_MODULE_URL = `${MODULE_BASE_URL}/src/document-agent/controller.ts`;
+const SAMPLE_BASE_URL = `${MODULE_BASE_URL}/samples`;
 const SAMPLE_FILE = 'biz_plan.hwp';
 
 await runTest('field-agent exact table cell HWP apply/reopen/revert gate', async ({ page }) => {
-  await page.goto(`${VITE_URL}/e2e/embed-harness.html`, { waitUntil: 'domcontentloaded' });
+  await page.goto(HARNESS_URL, { waitUntil: 'domcontentloaded' });
 
-  const result = await page.evaluate(async ({ editorModuleUrl, sampleFile }) => {
+  const result = await page.evaluate(async ({
+    editorModuleUrl,
+    controllerModuleUrl,
+    sampleBaseUrl,
+    sampleFile,
+    studioUrl,
+  }) => {
     const { createEditor } = await import(editorModuleUrl);
-    const { collectFieldTargetEvidence } = await import('/src/document-agent/controller.ts');
+    const { collectFieldTargetEvidence } = await import(controllerModuleUrl);
     const host = document.createElement('div');
     host.style.cssText = 'width: 100vw; height: 100vh';
     document.body.replaceChildren(host);
     const editor = await createEditor(host, {
-      studioUrl: `${location.origin}/`,
+      studioUrl: `${studioUrl.replace(/\/$/, '')}/`,
       renderer: 'canvas2d',
       handshakeTimeoutMs: 10_000,
     });
-    const sampleUrl = `/samples/${sampleFile.split('/').map(encodeURIComponent).join('/')}`;
+    const sampleUrl = `${sampleBaseUrl}/${sampleFile.split('/').map(encodeURIComponent).join('/')}`;
     const bytes = await fetch(sampleUrl).then(response => response.arrayBuffer());
     await editor.loadFile(bytes, sampleFile, { suppressDialogs: true });
     const studioWindow = editor.element.contentWindow;
@@ -223,7 +234,13 @@ await runTest('field-agent exact table cell HWP apply/reopen/revert gate', async
     offSelection();
     editor.destroy();
     return output;
-  }, { editorModuleUrl: EDITOR_MODULE_URL, sampleFile: SAMPLE_FILE });
+  }, {
+    editorModuleUrl: EDITOR_MODULE_URL,
+    controllerModuleUrl: CONTROLLER_MODULE_URL,
+    sampleBaseUrl: SAMPLE_BASE_URL,
+    sampleFile: SAMPLE_FILE,
+    studioUrl: STUDIO_URL,
+  });
 
   assert(result.sourceFormat === 'hwp', '실제 .hwp source format 유지');
   assert(result.applyElapsedMs <= 3000, 'field apply와 strict render 3초 이내');
@@ -262,20 +279,26 @@ await runTest('field-agent exact table cell HWP apply/reopen/revert gate', async
 }, { skipLoadApp: true });
 
 await runTest('field-agent exact form_text HWP apply/reopen/revert gate', async ({ page }) => {
-  await page.goto(`${VITE_URL}/e2e/embed-harness.html`, { waitUntil: 'domcontentloaded' });
+  await page.goto(HARNESS_URL, { waitUntil: 'domcontentloaded' });
 
-  const result = await page.evaluate(async ({ editorModuleUrl }) => {
+  const result = await page.evaluate(async ({
+    editorModuleUrl,
+    controllerModuleUrl,
+    sampleBaseUrl,
+    studioUrl,
+  }) => {
     const { createEditor } = await import(editorModuleUrl);
-    const { collectFieldTargetEvidence } = await import('/src/document-agent/controller.ts');
+    const { collectFieldTargetEvidence } = await import(controllerModuleUrl);
     const host = document.createElement('div');
     host.style.cssText = 'width: 100vw; height: 100vh';
     document.body.replaceChildren(host);
     const editor = await createEditor(host, {
-      studioUrl: `${location.origin}/`,
+      studioUrl: `${studioUrl.replace(/\/$/, '')}/`,
       renderer: 'canvas2d',
       handshakeTimeoutMs: 10_000,
     });
-    const bytes = await fetch('/samples/field-01.hwp').then(response => response.arrayBuffer());
+    const bytes = await fetch(`${sampleBaseUrl}/field-01.hwp`)
+      .then(response => response.arrayBuffer());
     await editor.loadFile(bytes, 'field-01.hwp', { suppressDialogs: true });
     const wasm = editor.element.contentWindow.__wasm;
     if (!wasm) throw new Error('Studio WasmBridge is unavailable');
@@ -384,7 +407,12 @@ await runTest('field-agent exact form_text HWP apply/reopen/revert gate', async 
     offSelection();
     editor.destroy();
     return output;
-  }, { editorModuleUrl: EDITOR_MODULE_URL });
+  }, {
+    editorModuleUrl: EDITOR_MODULE_URL,
+    controllerModuleUrl: CONTROLLER_MODULE_URL,
+    sampleBaseUrl: SAMPLE_BASE_URL,
+    studioUrl: STUDIO_URL,
+  });
 
   assert(result.original === '', '빈 누름틀 preimage를 exact 값으로 읽음');
   assert(result.applyElapsedMs <= 3000, 'form_text apply와 strict render 3초 이내');
