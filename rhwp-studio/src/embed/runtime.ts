@@ -16,6 +16,7 @@ interface EmbedRuntimeOptions {
   parentWindow: Window;
   handlers: EmbedRpcHandlers;
   subscribeDocumentChanged?: (listener: (payload: unknown) => void) => () => void;
+  subscribeFieldSelectionChanged?: (listener: (payload: unknown) => void) => () => void;
 }
 
 function errorText(error: unknown): string {
@@ -47,6 +48,7 @@ function bindPort(
   clientCapabilities: readonly string[],
   handlers: EmbedRpcHandlers,
   subscribeDocumentChanged?: (listener: (payload: unknown) => void) => () => void,
+  subscribeFieldSelectionChanged?: (listener: (payload: unknown) => void) => () => void,
 ): () => void {
   port.onmessage = async ({ data }) => {
     if (!isRequestAttempt(data, sessionId)) return;
@@ -69,9 +71,13 @@ function bindPort(
     const requiredCapability = {
       getDocumentState: 'document-state-v1',
       getSelectionContext: 'selection-context-v1',
+      getFieldSelectionContext: 'field-selection-events-v1',
       applyTextCommand: 'document-agent-command-v1',
       revertTextCommand: 'document-agent-command-v1',
       focusTarget: 'target-navigation-v1',
+      focusFieldTarget: 'field-target-navigation-v1',
+      applyFieldCommand: 'field-agent-command-v1',
+      revertFieldCommand: 'field-agent-command-v1',
     }[data.method];
     if (requiredCapability && !clientCapabilities.includes(requiredCapability)) {
       response.error = {
@@ -100,15 +106,29 @@ function bindPort(
     type: 'rhwp-connected', version: EMBED_PROTOCOL_VERSION, sessionId,
     capabilities: EMBED_CAPABILITIES,
   });
-  return subscribeDocumentChanged?.((payload) => {
-    port.postMessage({
-      type: 'rhwp-event',
-      version: EMBED_PROTOCOL_VERSION,
-      sessionId,
-      event: 'documentChanged',
-      payload,
-    });
-  }) ?? (() => {});
+  const unsubscribe = [
+    subscribeDocumentChanged?.((payload) => {
+      port.postMessage({
+        type: 'rhwp-event',
+        version: EMBED_PROTOCOL_VERSION,
+        sessionId,
+        event: 'documentChanged',
+        payload,
+      });
+    }),
+    subscribeFieldSelectionChanged?.((payload) => {
+      port.postMessage({
+        type: 'rhwp-event',
+        version: EMBED_PROTOCOL_VERSION,
+        sessionId,
+        event: 'fieldSelectionChanged',
+        payload,
+      });
+    }),
+  ].filter((off): off is () => void => typeof off === 'function');
+  return () => {
+    for (const off of unsubscribe) off();
+  };
 }
 
 function rejectConnect(port: MessagePort, attempt: { version: number; sessionId: string }): void {
@@ -141,7 +161,8 @@ async function handleLegacy(
   const params = isHwpctl ? message : message.params;
   const response: Record<string, unknown> = { type: 'rhwp-response', id: message.id };
   try {
-    if (method === 'applyTextCommand' || method === 'revertTextCommand') {
+    if (method === 'applyTextCommand' || method === 'revertTextCommand'
+        || method === 'applyFieldCommand' || method === 'revertFieldCommand') {
       throw new Error('Legacy embed transport cannot execute document mutations.');
     }
     const result = await routeEmbedRequest(method, params, handlers, true);
@@ -159,7 +180,7 @@ export function installEmbedRuntime(options: EmbedRuntimeOptions): () => void {
     origin: string;
     sessionId: string;
     port: MessagePort;
-    offDocumentChanged: () => void;
+    offEvents: () => void;
   } | null = null;
   const onMessage = (event: MessageEvent) => {
     const transferredPorts = Array.from(event.ports);
@@ -192,7 +213,7 @@ export function installEmbedRuntime(options: EmbedRuntimeOptions): () => void {
         return;
       }
       ports.add(port);
-      const offDocumentChanged = bindPort(
+      const offEvents = bindPort(
         port,
         event.data.sessionId,
         event.data.capabilities,
@@ -200,8 +221,11 @@ export function installEmbedRuntime(options: EmbedRuntimeOptions): () => void {
         event.data.capabilities.includes('document-change-events-v1')
           ? options.subscribeDocumentChanged
           : undefined,
+        event.data.capabilities.includes('field-selection-events-v1')
+          ? options.subscribeFieldSelectionChanged
+          : undefined,
       );
-      binding = { origin: event.origin, sessionId: event.data.sessionId, port, offDocumentChanged };
+      binding = { origin: event.origin, sessionId: event.data.sessionId, port, offEvents };
       return;
     }
     if (binding) return;
@@ -210,7 +234,7 @@ export function installEmbedRuntime(options: EmbedRuntimeOptions): () => void {
   options.hostWindow.addEventListener('message', onMessage);
   return () => {
     options.hostWindow.removeEventListener('message', onMessage);
-    binding?.offDocumentChanged();
+    binding?.offEvents();
     for (const port of ports) releasePort(port);
     ports.clear();
     binding = null;

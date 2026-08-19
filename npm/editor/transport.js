@@ -9,6 +9,9 @@ const CAPABILITIES = [
   'selection-context-v1',
   'document-agent-command-v1',
   'target-navigation-v1',
+  'field-target-navigation-v1',
+  'field-agent-command-v1',
+  'field-selection-events-v1',
   'document-change-events-v1',
 ];
 const LONG_RUNNING_METHODS = new Set([
@@ -181,9 +184,14 @@ export class EditorTransport {
     if (message?.type === 'rhwp-event') {
       const keys = Object.keys(message).sort();
       const expectedKeys = ['event', 'payload', 'sessionId', 'type', 'version'];
+      const requiredCapability = {
+        documentChanged: 'document-change-events-v1',
+        fieldSelectionChanged: 'field-selection-events-v1',
+      }[message.event];
       if (message.version !== PROTOCOL_VERSION
           || message.sessionId !== this._sessionId
-          || !this._peerCapabilities.has('document-change-events-v1')
+          || !requiredCapability
+          || !this._peerCapabilities.has(requiredCapability)
           || keys.length !== expectedKeys.length
           || keys.some((key, index) => key !== expectedKeys[index])
           || typeof message.event !== 'string') return;

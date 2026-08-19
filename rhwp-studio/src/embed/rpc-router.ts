@@ -3,16 +3,24 @@ import type { EmbedFontDecisionTraceV1 } from '../core/font-decision-trace.ts';
 import {
   assertEmptyParams,
   assertOnlyParam,
+  parseApplyFieldCommand,
   parseApplyTextCommand,
   parseBodyParagraphTarget,
+  parseRevertFieldCommand,
   parseRevertTextCommand,
+  parseTableCellTextTarget,
 } from '../document-agent/contract.ts';
 import type {
+  RhwpApplyFieldCommandV1,
   RhwpApplyTextCommandV1,
   RhwpBodyParagraphTargetV1,
   RhwpDocumentStateV1,
+  RhwpFieldCommandReceiptV1,
+  RhwpFieldSelectionContextV1,
+  RhwpRevertFieldCommandV1,
   RhwpRevertTextCommandV1,
   RhwpSelectionContextV1,
+  RhwpTableCellTextTargetV1,
   RhwpTextCommandReceiptV1,
 } from '../document-agent/types.ts';
 import type {
@@ -48,9 +56,13 @@ export interface EmbedRpcHandlers {
   notifySaved(fileName?: string): Promise<EmbedNotifySavedResult>;
   getDocumentState(): Promise<RhwpDocumentStateV1>;
   getSelectionContext(): Promise<RhwpSelectionContextV1>;
+  getFieldSelectionContext(): Promise<RhwpFieldSelectionContextV1>;
   applyTextCommand(command: RhwpApplyTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   revertTextCommand(command: RhwpRevertTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   focusTarget(target: RhwpBodyParagraphTargetV1): Promise<{ focused: boolean; page: number }>;
+  focusFieldTarget(target: RhwpTableCellTextTargetV1): Promise<{ focused: boolean; page: number }>;
+  applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
+  revertFieldCommand(command: RhwpRevertFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
 
   // ── 브리지 확장 (P4) ────────────────────────────────────
   // 자동화·플러그인·창 제어. 부모는 **구조화 복제 가능한 값만** 보낼 수 있으므로 함수를 받는
@@ -176,6 +188,9 @@ export async function routeEmbedRequest(
     case 'getSelectionContext':
       assertEmptyParams(params, 'getSelectionContext params');
       return handlers.getSelectionContext();
+    case 'getFieldSelectionContext':
+      assertEmptyParams(params, 'getFieldSelectionContext params');
+      return handlers.getFieldSelectionContext();
     case 'applyTextCommand': return handlers.applyTextCommand(parseApplyTextCommand(
       assertOnlyParam(params, 'command', 'applyTextCommand params'),
     ));
@@ -184,6 +199,15 @@ export async function routeEmbedRequest(
     ));
     case 'focusTarget': return handlers.focusTarget(parseBodyParagraphTarget(
       assertOnlyParam(params, 'target', 'focusTarget params'),
+    ));
+    case 'focusFieldTarget': return handlers.focusFieldTarget(parseTableCellTextTarget(
+      assertOnlyParam(params, 'target', 'focusFieldTarget params'),
+    ));
+    case 'applyFieldCommand': return handlers.applyFieldCommand(parseApplyFieldCommand(
+      assertOnlyParam(params, 'command', 'applyFieldCommand params'),
+    ));
+    case 'revertFieldCommand': return handlers.revertFieldCommand(parseRevertFieldCommand(
+      assertOnlyParam(params, 'command', 'revertFieldCommand params'),
     ));
     // ── 브리지 확장 (P4) ──────────────────────────────────
     case 'automation.list': return handlers.automationList();

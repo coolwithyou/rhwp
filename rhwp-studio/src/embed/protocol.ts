@@ -15,6 +15,9 @@ export const EMBED_CAPABILITIES = [
   'selection-context-v1',
   'document-agent-command-v1',
   'target-navigation-v1',
+  'field-target-navigation-v1',
+  'field-agent-command-v1',
+  'field-selection-events-v1',
   'document-change-events-v1',
 ] as const;
 

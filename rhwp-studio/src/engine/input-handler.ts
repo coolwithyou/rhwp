@@ -2472,9 +2472,10 @@ export class InputHandler {
       // 일반 커서 이동/텍스트 입력 경로에서는 새 bbox 조회를 하지 않고, 표 hover/resize 경로에서
       // 이미 확보한 캐시가 있을 때만 재사용한다.
       if (inCell) {
-        const cellKey = `${pos.sectionIndex}:${pos.parentParaIndex}:${pos.controlIndex}:${pos.cellIndex}`;
+        const cellKey = `${pos.sectionIndex}:${pos.parentParaIndex}:${pos.controlIndex}:${pos.cellIndex}:${pos.cellParaIndex}`;
         if (cellKey !== this.lastCellKey) {
           this.lastCellKey = cellKey;
+          this.eventBus.emit('document-agent-field-selection-changed');
           const sec = pos.sectionIndex;
           const ppi = pos.parentParaIndex!;
           const ci = pos.controlIndex!;
@@ -2495,6 +2496,7 @@ export class InputHandler {
         }
       } else if (this.lastCellKey !== null) {
         this.lastCellKey = null;
+        this.eventBus.emit('document-agent-field-selection-changed');
         this.eventBus.emit('cursor-cell-changed', { inCell: false });
       }
     } catch {
@@ -4156,6 +4158,65 @@ export class InputHandler {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /** current revision의 exact 표 셀 텍스트 target으로 이동한다. 문서 mutation은 발생하지 않는다. */
+  focusTableCellText(
+    section: number,
+    parentPara: number,
+    controlIndex: number,
+    cellIndex: number,
+    cellParagraph: number,
+  ): { focused: boolean; page: number } {
+    if (![section, parentPara, controlIndex, cellIndex, cellParagraph]
+      .every((value) => Number.isSafeInteger(value) && value >= 0)) {
+      return { focused: false, page: 1 };
+    }
+    try {
+      const paragraphCount = this.wasm.getCellParagraphCount(
+        section,
+        parentPara,
+        controlIndex,
+        cellIndex,
+      );
+      if (cellParagraph >= paragraphCount) return { focused: false, page: 1 };
+      this.wasm.getCellParagraphLength(
+        section,
+        parentPara,
+        controlIndex,
+        cellIndex,
+        cellParagraph,
+      );
+
+      this.exitFootnoteModeForBodyNavigation();
+      this.cursor.clearSelection();
+      this.cursor.moveTo({
+        sectionIndex: section,
+        paragraphIndex: cellParagraph,
+        charOffset: 0,
+        parentParaIndex: parentPara,
+        controlIndex,
+        cellIndex,
+        cellParaIndex: cellParagraph,
+      });
+      this.cursor.resetPreferredX();
+      this.active = true;
+      this.updateCaret(true);
+      this.focusTextarea();
+
+      const rect = this.cursor.getRect();
+      if (!rect) return { focused: false, page: 1 };
+      const zoom = this.viewportManager.getZoom();
+      const centerY = this.virtualScroll.getPageOffset(rect.pageIndex) + rect.y * zoom;
+      const maxScrollTop = Math.max(0, this.container.scrollHeight - this.container.clientHeight);
+      this.container.scrollTop = Math.max(
+        0,
+        Math.min(maxScrollTop, centerY - this.container.clientHeight / 2),
+      );
+      return { focused: true, page: rect.pageIndex + 1 };
+    } catch {
+      return { focused: false, page: 1 };
     }
   }
 

@@ -6,6 +6,16 @@ export interface RhwpBodyParagraphTargetV1 {
   length: number;
 }
 
+/** 서버가 current revision에서 확정한 표 셀 텍스트 입력 위치. */
+export interface RhwpTableCellTextTargetV1 {
+  kind: 'table_cell_text';
+  section: number;
+  parentPara: number;
+  controlIndex: number;
+  cellIndex: number;
+  cellParagraph: number;
+}
+
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
   format: 'hwp' | 'hwpx';
@@ -25,6 +35,16 @@ export interface RhwpSelectionContextV1 {
   collapsed: boolean;
   target: RhwpBodyParagraphTargetV1 | null;
   selectedTextSha256: string | null;
+}
+
+/** 현재 캐럿이 가리키는 exact 표 셀 입력 위치. 문서 변경 없이 UI 선택을 동기화한다. */
+export interface RhwpFieldSelectionContextV1 {
+  schemaVersion: 1;
+  documentEpoch: number;
+  changeSeq: number;
+  page: number;
+  editable: boolean;
+  target: RhwpTableCellTextTargetV1 | null;
 }
 
 export interface RhwpApplyTextCommandV1 {
@@ -49,6 +69,30 @@ export interface RhwpRevertTextCommandV1 {
   expectedAfterSha256: string;
 }
 
+/** 서버가 current revision의 exact field binding으로 승인한 atomic text 치환. */
+export interface RhwpApplyFieldCommandV1 {
+  schemaVersion: 1;
+  commandId: string;
+  expectedDocumentEpoch: number;
+  expectedChangeSeq: number;
+  expectedDocumentSha256: string;
+  target: RhwpTableCellTextTargetV1;
+  expectedBeforeSha256: string;
+  expectedFormatSha256: string;
+  expectedAdjacentContextSha256: string;
+  replacement: string;
+}
+
+/** 같은 Studio 세션에서 가장 최근에 성공한 field command만 exact revert한다. */
+export interface RhwpRevertFieldCommandV1 {
+  schemaVersion: 1;
+  commandId: string;
+  expectedDocumentEpoch: number;
+  expectedChangeSeq: number;
+  expectedAfterDocumentSha256: string;
+  expectedAfterSha256: string;
+}
+
 export interface RhwpTextCommandReceiptV1 {
   schemaVersion: 1;
   commandId: string;
@@ -65,6 +109,24 @@ export interface RhwpTextCommandReceiptV1 {
   pageCountBefore: number;
   pageCountAfter: number;
   target: RhwpBodyParagraphTargetV1;
+}
+
+export interface RhwpFieldCommandReceiptV1 {
+  schemaVersion: 1;
+  commandId: string;
+  operation: 'apply' | 'revert';
+  documentEpoch: number;
+  beforeChangeSeq: number;
+  afterChangeSeq: number;
+  beforeDocumentSha256: string;
+  afterDocumentSha256: string;
+  beforeTextSha256: string;
+  afterTextSha256: string;
+  formatSha256: string;
+  adjacentContextSha256: string;
+  pageCountBefore: number;
+  pageCountAfter: number;
+  target: RhwpTableCellTextTargetV1;
 }
 
 export const DOCUMENT_AGENT_ERROR_CODES = [

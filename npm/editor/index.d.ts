@@ -208,6 +208,15 @@ export interface RhwpBodyParagraphTargetV1 {
   length: number;
 }
 
+export interface RhwpTableCellTextTargetV1 {
+  kind: 'table_cell_text';
+  section: number;
+  parentPara: number;
+  controlIndex: number;
+  cellIndex: number;
+  cellParagraph: number;
+}
+
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
   format: 'hwp' | 'hwpx';
@@ -228,6 +237,16 @@ export interface RhwpSelectionContextV1 {
   collapsed: boolean;
   target: RhwpBodyParagraphTargetV1 | null;
   selectedTextSha256: string | null;
+}
+
+export interface RhwpFieldSelectionContextV1 {
+  schemaVersion: 1;
+  documentEpoch: number;
+  changeSeq: number;
+  /** 1부터 시작하는 UI 페이지 번호 */
+  page: number;
+  editable: boolean;
+  target: RhwpTableCellTextTargetV1 | null;
 }
 
 export interface RhwpApplyTextCommandV1 {
@@ -252,6 +271,21 @@ export interface RhwpRevertTextCommandV1 {
   expectedAfterSha256: string;
 }
 
+export interface RhwpApplyFieldCommandV1 {
+  schemaVersion: 1;
+  commandId: string;
+  expectedDocumentEpoch: number;
+  expectedChangeSeq: number;
+  expectedDocumentSha256: string;
+  target: RhwpTableCellTextTargetV1;
+  expectedBeforeSha256: string;
+  expectedFormatSha256: string;
+  expectedAdjacentContextSha256: string;
+  replacement: string;
+}
+
+export type RhwpRevertFieldCommandV1 = RhwpRevertTextCommandV1;
+
 export interface RhwpTextCommandReceiptV1 {
   schemaVersion: 1;
   commandId: string;
@@ -270,9 +304,27 @@ export interface RhwpTextCommandReceiptV1 {
   target: RhwpBodyParagraphTargetV1;
 }
 
+export interface RhwpFieldCommandReceiptV1 {
+  schemaVersion: 1;
+  commandId: string;
+  operation: 'apply' | 'revert';
+  documentEpoch: number;
+  beforeChangeSeq: number;
+  afterChangeSeq: number;
+  beforeDocumentSha256: string;
+  afterDocumentSha256: string;
+  beforeTextSha256: string;
+  afterTextSha256: string;
+  formatSha256: string;
+  adjacentContextSha256: string;
+  pageCountBefore: number;
+  pageCountAfter: number;
+  target: RhwpTableCellTextTargetV1;
+}
+
 export interface RhwpDocumentChangedEventV1 {
   schemaVersion: 1;
-  reason: 'agent_apply' | 'agent_revert';
+  reason: 'agent_apply' | 'agent_revert' | 'field_agent_apply' | 'field_agent_revert';
   documentEpoch: number;
   changeSeq: number;
   commandId: string;
@@ -317,14 +369,24 @@ export declare class RhwpEditor {
   getDocumentState(): Promise<RhwpDocumentStateV1>;
   /** 현재 캐럿/선택의 exact body paragraph 컨텍스트 */
   getSelectionContext(): Promise<RhwpSelectionContextV1>;
+  /** 현재 캐럿의 exact table cell 컨텍스트 */
+  getFieldSelectionContext(): Promise<RhwpFieldSelectionContextV1>;
   /** exact preimage fence를 검증하고 문단 전체를 한 트랜잭션으로 교체 */
   applyTextCommand(command: RhwpApplyTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   /** 가장 최근에 성공한 exact command를 한 트랜잭션으로 되돌림 */
   revertTextCommand(command: RhwpRevertTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   /** exact body paragraph target으로 캐럿과 뷰포트 이동 */
   focusTarget(target: RhwpBodyParagraphTargetV1): Promise<{ focused: boolean; page: number }>;
+  /** exact table cell text target으로 캐럿과 뷰포트 이동 */
+  focusFieldTarget(target: RhwpTableCellTextTargetV1): Promise<{ focused: boolean; page: number }>;
+  /** exact table cell field를 한 트랜잭션으로 교체 */
+  applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
+  /** 가장 최근 exact field command를 한 트랜잭션으로 되돌림 */
+  revertFieldCommand(command: RhwpRevertFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
   /** agent apply/revert가 commit된 뒤 strict v1 변경 이벤트 구독 */
   onDocumentChanged(listener: (event: RhwpDocumentChangedEventV1) => void): () => void;
+  /** Studio 표 셀 선택이 바뀔 때 strict v1 field selection 구독 */
+  onFieldSelectionChanged(listener: (event: RhwpFieldSelectionContextV1) => void): () => void;
   /** iframe 엘리먼트를 반환합니다 */
   readonly element: HTMLIFrameElement;
   // ── 브리지 표면 ────────────────────────────────────────────────

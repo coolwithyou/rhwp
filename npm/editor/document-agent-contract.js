@@ -63,6 +63,23 @@ export function validateBodyParagraphTarget(value, code = 'INVALID_COMMAND') {
   return target;
 }
 
+export function validateTableCellTextTarget(value, code = 'INVALID_COMMAND') {
+  const target = record(value, 'target', code);
+  exactKeys(
+    target,
+    ['kind', 'section', 'parentPara', 'controlIndex', 'cellIndex', 'cellParagraph'],
+    'target',
+    code,
+  );
+  if (target.kind !== 'table_cell_text') {
+    throw contractError(code, 'target.kind must be table_cell_text');
+  }
+  for (const key of ['section', 'parentPara', 'controlIndex', 'cellIndex', 'cellParagraph']) {
+    safeInteger(target[key], `target.${key}`, 0, code);
+  }
+  return target;
+}
+
 export function validateApplyTextCommand(value) {
   const code = 'INVALID_COMMAND';
   const command = record(value, 'command', code);
@@ -80,6 +97,44 @@ export function validateApplyTextCommand(value) {
   safeInteger(command.expectedChangeSeq, 'command.expectedChangeSeq', 0, code);
   sha256(command.expectedDocumentSha256, 'command.expectedDocumentSha256', code);
   validateBodyParagraphTarget(command.target, code);
+  sha256(command.expectedBeforeSha256, 'command.expectedBeforeSha256', code);
+  sha256(command.expectedFormatSha256, 'command.expectedFormatSha256', code);
+  sha256(command.expectedAdjacentContextSha256, 'command.expectedAdjacentContextSha256', code);
+  if (typeof command.replacement !== 'string'
+      || Array.from(command.replacement).length > 4000) {
+    throw contractError(code, 'command.replacement must be a string with at most 4000 characters');
+  }
+  if (/[\u0000-\u001f\u007f]/u.test(command.replacement)) {
+    throw contractError(code, 'command.replacement must not contain control characters');
+  }
+  return command;
+}
+
+export function validateApplyFieldCommand(value) {
+  const command = validateApplyTextCommandShape(value, validateTableCellTextTarget);
+  if (/\r|\n/u.test(command.replacement)) {
+    throw contractError('INVALID_COMMAND', 'field command replacement must not contain line breaks');
+  }
+  return command;
+}
+
+function validateApplyTextCommandShape(value, validateTarget) {
+  const code = 'INVALID_COMMAND';
+  const command = record(value, 'command', code);
+  exactKeys(command, [
+    'schemaVersion', 'commandId', 'expectedDocumentEpoch', 'expectedChangeSeq',
+    'expectedDocumentSha256', 'target', 'expectedBeforeSha256',
+    'expectedFormatSha256', 'expectedAdjacentContextSha256', 'replacement',
+  ], 'command', code);
+  if (command.schemaVersion !== 1) throw contractError(code, 'command.schemaVersion must be 1');
+  if (typeof command.commandId !== 'string'
+      || command.commandId.length < 1 || command.commandId.length > 128) {
+    throw contractError(code, 'command.commandId must be a string in 1..=128 characters');
+  }
+  safeInteger(command.expectedDocumentEpoch, 'command.expectedDocumentEpoch', 1, code);
+  safeInteger(command.expectedChangeSeq, 'command.expectedChangeSeq', 0, code);
+  sha256(command.expectedDocumentSha256, 'command.expectedDocumentSha256', code);
+  validateTarget(command.target, code);
   sha256(command.expectedBeforeSha256, 'command.expectedBeforeSha256', code);
   sha256(command.expectedFormatSha256, 'command.expectedFormatSha256', code);
   sha256(command.expectedAdjacentContextSha256, 'command.expectedAdjacentContextSha256', code);
@@ -111,6 +166,8 @@ export function validateRevertTextCommand(value) {
   sha256(command.expectedAfterSha256, 'command.expectedAfterSha256', code);
   return command;
 }
+
+export const validateRevertFieldCommand = validateRevertTextCommand;
 
 export function validateDocumentState(value) {
   const code = 'INVALID_RESPONSE';
@@ -153,6 +210,26 @@ export function validateSelectionContext(value) {
   return selection;
 }
 
+export function validateFieldSelectionContext(value) {
+  const code = 'INVALID_RESPONSE';
+  const selection = record(value, 'field selection context', code);
+  exactKeys(selection, [
+    'schemaVersion', 'documentEpoch', 'changeSeq', 'page', 'editable', 'target',
+  ], 'field selection context', code);
+  if (selection.schemaVersion !== 1) {
+    throw contractError(code, 'field selection context schemaVersion must be 1');
+  }
+  safeInteger(selection.documentEpoch, 'field selection context documentEpoch', 1, code);
+  safeInteger(selection.changeSeq, 'field selection context changeSeq', 0, code);
+  safeInteger(selection.page, 'field selection context page', 1, code);
+  boolean(selection.editable, 'field selection context editable', code);
+  if (selection.target !== null) validateTableCellTextTarget(selection.target, code);
+  if (selection.target === null && selection.editable) {
+    throw contractError(code, 'field selection context without target cannot be editable');
+  }
+  return selection;
+}
+
 export function validateTextCommandReceipt(value) {
   const code = 'INVALID_RESPONSE';
   const receipt = record(value, 'text command receipt', code);
@@ -186,6 +263,43 @@ export function validateTextCommandReceipt(value) {
   return receipt;
 }
 
+export function validateFieldCommandReceipt(value) {
+  return validateCommandReceiptShape(value, validateTableCellTextTarget, 'field command receipt');
+}
+
+function validateCommandReceiptShape(value, validateTarget, label) {
+  const code = 'INVALID_RESPONSE';
+  const receipt = record(value, label, code);
+  exactKeys(receipt, [
+    'schemaVersion', 'commandId', 'operation', 'documentEpoch', 'beforeChangeSeq',
+    'afterChangeSeq', 'beforeDocumentSha256', 'afterDocumentSha256',
+    'beforeTextSha256', 'afterTextSha256', 'formatSha256',
+    'adjacentContextSha256', 'pageCountBefore', 'pageCountAfter', 'target',
+  ], label, code);
+  if (receipt.schemaVersion !== 1) throw contractError(code, 'receipt.schemaVersion must be 1');
+  if (typeof receipt.commandId !== 'string'
+      || receipt.commandId.length < 1 || receipt.commandId.length > 128) {
+    throw contractError(code, 'receipt.commandId is invalid');
+  }
+  if (receipt.operation !== 'apply' && receipt.operation !== 'revert') {
+    throw contractError(code, 'receipt.operation is invalid');
+  }
+  safeInteger(receipt.documentEpoch, 'receipt.documentEpoch', 1, code);
+  safeInteger(receipt.beforeChangeSeq, 'receipt.beforeChangeSeq', 0, code);
+  safeInteger(receipt.afterChangeSeq, 'receipt.afterChangeSeq', 1, code);
+  if (receipt.afterChangeSeq !== receipt.beforeChangeSeq + 1) {
+    throw contractError(code, 'receipt change sequence is invalid');
+  }
+  for (const key of [
+    'beforeDocumentSha256', 'afterDocumentSha256', 'beforeTextSha256',
+    'afterTextSha256', 'formatSha256', 'adjacentContextSha256',
+  ]) sha256(receipt[key], `receipt.${key}`, code);
+  safeInteger(receipt.pageCountBefore, 'receipt.pageCountBefore', 1, code);
+  safeInteger(receipt.pageCountAfter, 'receipt.pageCountAfter', 1, code);
+  validateTarget(receipt.target, code);
+  return receipt;
+}
+
 export function validateFocusTargetResult(value) {
   const code = 'INVALID_RESPONSE';
   const result = record(value, 'focus target result', code);
@@ -204,7 +318,7 @@ export function validateDocumentChangedEvent(value) {
   if (event.schemaVersion !== 1) {
     throw contractError(code, 'document changed event schemaVersion must be 1');
   }
-  if (event.reason !== 'agent_apply' && event.reason !== 'agent_revert') {
+  if (!['agent_apply', 'agent_revert', 'field_agent_apply', 'field_agent_revert'].includes(event.reason)) {
     throw contractError(code, 'document changed event reason is invalid');
   }
   safeInteger(event.documentEpoch, 'document changed event documentEpoch', 1, code);

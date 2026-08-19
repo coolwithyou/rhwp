@@ -1694,6 +1694,13 @@ installEmbedRuntime({
   hostWindow: window,
   parentWindow: window.parent,
   subscribeDocumentChanged: (listener) => eventBus.on('document-agent-changed', listener),
+  subscribeFieldSelectionChanged: (listener) => eventBus.on(
+    'document-agent-field-selection-changed',
+    () => {
+      if (!documentAgent) return;
+      listener(documentAgent.getFieldSelectionContext());
+    },
+  ),
   handlers: {
     async ready() {
       await initPromise;
@@ -1776,6 +1783,11 @@ installEmbedRuntime({
       if (!documentAgent) throw new Error('Document agent is not initialized');
       return documentAgent.getSelectionContext();
     },
+    async getFieldSelectionContext() {
+      await initPromise;
+      if (!documentAgent) throw new Error('Document agent is not initialized');
+      return documentAgent.getFieldSelectionContext();
+    },
     async applyTextCommand(command) {
       await initPromise;
       if (!documentAgent) throw new Error('Document agent is not initialized');
@@ -1790,6 +1802,21 @@ installEmbedRuntime({
       await initPromise;
       if (!documentAgent) throw new Error('Document agent is not initialized');
       return documentAgent.focusTarget(target);
+    },
+    async focusFieldTarget(target) {
+      await initPromise;
+      if (!documentAgent) throw new Error('Document agent is not initialized');
+      return documentAgent.focusFieldTarget(target);
+    },
+    async applyFieldCommand(command) {
+      await initPromise;
+      if (!documentAgent) throw new Error('Document agent is not initialized');
+      return documentAgent.applyFieldCommand(command);
+    },
+    async revertFieldCommand(command) {
+      await initPromise;
+      if (!documentAgent) throw new Error('Document agent is not initialized');
+      return documentAgent.revertFieldCommand(command);
     },
 
     // ── 브리지 확장 (P4) — 자동화·플러그인·창 제어 ─────────

@@ -60,6 +60,9 @@ test('embed protocol은 capability를 포함한 v1 connect와 session-bound requ
     'selection-context-v1',
     'document-agent-command-v1',
     'target-navigation-v1',
+    'field-target-navigation-v1',
+    'field-agent-command-v1',
+    'field-selection-events-v1',
     'document-change-events-v1',
   ]);
 
@@ -155,6 +158,14 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     charOffset: 0 as const,
     length: 7,
   };
+  const fieldTarget = {
+    kind: 'table_cell_text' as const,
+    section: 0,
+    parentPara: 4,
+    controlIndex: 1,
+    cellIndex: 3,
+    cellParagraph: 0,
+  };
   const apply = {
     schemaVersion: 1 as const,
     commandId: 'cmd-1',
@@ -178,33 +189,51 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
   const handlers = {
     getDocumentState: async () => { calls.push({ method: 'state' }); return { ok: true }; },
     getSelectionContext: async () => { calls.push({ method: 'selection' }); return { ok: true }; },
+    getFieldSelectionContext: async () => { calls.push({ method: 'field-selection' }); return { ok: true }; },
     applyTextCommand: async (value: unknown) => { calls.push({ method: 'apply', value }); return { ok: true }; },
     revertTextCommand: async (value: unknown) => { calls.push({ method: 'revert', value }); return { ok: true }; },
     focusTarget: async (value: unknown) => { calls.push({ method: 'focus', value }); return { ok: true }; },
+    focusFieldTarget: async (value: unknown) => { calls.push({ method: 'focus-field', value }); return { ok: true }; },
+    applyFieldCommand: async (value: unknown) => { calls.push({ method: 'apply-field', value }); return { ok: true }; },
+    revertFieldCommand: async (value: unknown) => { calls.push({ method: 'revert-field', value }); return { ok: true }; },
   } as EmbedRpcHandlers;
 
   await routeEmbedRequest('getDocumentState', {}, handlers);
   await routeEmbedRequest('getSelectionContext', {}, handlers);
+  await routeEmbedRequest('getFieldSelectionContext', {}, handlers);
   await routeEmbedRequest('applyTextCommand', { command: apply }, handlers);
   await routeEmbedRequest('revertTextCommand', { command: revert }, handlers);
   await routeEmbedRequest('focusTarget', { target }, handlers);
+  await routeEmbedRequest('focusFieldTarget', { target: fieldTarget }, handlers);
+  await routeEmbedRequest('applyFieldCommand', { command: { ...apply, target: fieldTarget } }, handlers);
+  await routeEmbedRequest('revertFieldCommand', { command: revert }, handlers);
   assert.deepEqual(calls, [
     { method: 'state' },
     { method: 'selection' },
+    { method: 'field-selection' },
     { method: 'apply', value: apply },
     { method: 'revert', value: revert },
     { method: 'focus', value: target },
+    { method: 'focus-field', value: fieldTarget },
+    { method: 'apply-field', value: { ...apply, target: fieldTarget } },
+    { method: 'revert-field', value: revert },
   ]);
 
   for (const [method, params] of [
     ['getDocumentState', { extra: true }],
     ['getSelectionContext', { extra: true }],
+    ['getFieldSelectionContext', { extra: true }],
     ['applyTextCommand', { command: { ...apply, extra: true } }],
     ['applyTextCommand', { command: { ...apply, expectedChangeSeq: Number.NaN } }],
     ['applyTextCommand', { command: { ...apply, replacement: 'line1\nline2' } }],
     ['revertTextCommand', { command: { ...revert, expectedAfterSha256: 'bad' } }],
     ['focusTarget', { target: { ...target, charOffset: 1 } }],
     ['focusTarget', { target: { ...target, length: 4001 } }],
+    ['focusFieldTarget', { target: { ...fieldTarget, cellIndex: -1 } }],
+    ['focusFieldTarget', { target: { ...fieldTarget, page: 1 } }],
+    ['applyFieldCommand', { command: { ...apply, target: { ...fieldTarget, cellIndex: -1 } } }],
+    ['applyFieldCommand', { command: { ...apply, target: fieldTarget, replacement: 'line1\nline2' } }],
+    ['revertFieldCommand', { command: { ...revert, expectedAfterSha256: 'bad' } }],
   ] as const) {
     await assert.rejects(
       () => routeEmbedRequest(method, params, handlers),
@@ -687,9 +716,10 @@ test('embed legacy transport는 document mutation method를 dispatch하지 않�
   }
 });
 
-test('embed runtime은 bound port에 documentChanged v1 event를 전달하고 cleanup한다', async () => {
+test('embed runtime은 documentChanged와 fieldSelectionChanged v1 event를 전달하고 cleanup한다', async () => {
   let messageListener: (event: MessageEvent) => void = () => {};
   let emitDocumentChanged: (payload: unknown) => void = () => {};
+  let emitFieldSelectionChanged: (payload: unknown) => void = () => {};
   let unsubscribed = 0;
   const hostWindow = {
     addEventListener(_type: string, listener: (event: MessageEvent) => void) {
@@ -706,6 +736,10 @@ test('embed runtime은 bound port에 documentChanged v1 event를 전달하고 cl
       emitDocumentChanged = listener;
       return () => { unsubscribed += 1; };
     },
+    subscribeFieldSelectionChanged(listener) {
+      emitFieldSelectionChanged = listener;
+      return () => { unsubscribed += 1; };
+    },
   });
   const channel = new MessageChannel();
   const eventPayload = {
@@ -715,10 +749,28 @@ test('embed runtime은 bound port에 documentChanged v1 event를 전달하고 cl
     changeSeq: 1,
     commandId: 'cmd-1',
   };
-  const eventMessage = new Promise<unknown>((resolve) => {
+  const fieldPayload = {
+    schemaVersion: 1,
+    documentEpoch: 2,
+    changeSeq: 1,
+    page: 1,
+    editable: true,
+    target: {
+      kind: 'table_cell_text', section: 0, parentPara: 1,
+      controlIndex: 0, cellIndex: 1, cellParagraph: 0,
+    },
+  };
+  const eventMessages = new Promise<unknown[]>((resolve) => {
+    const received: unknown[] = [];
     channel.port1.onmessage = ({ data }) => {
-      if (data.type === 'rhwp-connected') emitDocumentChanged(eventPayload);
-      if (data.type === 'rhwp-event') resolve(data);
+      if (data.type === 'rhwp-connected') {
+        emitDocumentChanged(eventPayload);
+        emitFieldSelectionChanged(fieldPayload);
+      }
+      if (data.type === 'rhwp-event') {
+        received.push(data);
+        if (received.length === 2) resolve(received);
+      }
     };
     channel.port1.start();
   });
@@ -726,19 +778,29 @@ test('embed runtime은 bound port에 documentChanged v1 event를 전달하고 cl
   messageListener({
     data: {
       type: 'rhwp-connect', version: 1, sessionId: 'agent-event',
-      capabilities: ['transferable-array-buffer', 'document-change-events-v1'],
+      capabilities: [
+        'transferable-array-buffer',
+        'document-change-events-v1',
+        'field-selection-events-v1',
+      ],
     },
     source: parentWindow,
     origin: 'https://host.example',
     ports: [channel.port2],
   } as unknown as MessageEvent);
 
-  assert.deepEqual(await eventMessage, {
-    type: 'rhwp-event', version: 1, sessionId: 'agent-event',
-    event: 'documentChanged', payload: eventPayload,
-  });
+  assert.deepEqual(await eventMessages, [
+    {
+      type: 'rhwp-event', version: 1, sessionId: 'agent-event',
+      event: 'documentChanged', payload: eventPayload,
+    },
+    {
+      type: 'rhwp-event', version: 1, sessionId: 'agent-event',
+      event: 'fieldSelectionChanged', payload: fieldPayload,
+    },
+  ]);
   cleanup();
-  assert.equal(unsubscribed, 1);
+  assert.equal(unsubscribed, 2);
   channel.port1.close();
 });
 

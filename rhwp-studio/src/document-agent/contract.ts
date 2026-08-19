@@ -1,8 +1,11 @@
 import {
   DocumentAgentError,
+  type RhwpApplyFieldCommandV1,
   type RhwpApplyTextCommandV1,
   type RhwpBodyParagraphTargetV1,
+  type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
+  type RhwpTableCellTextTargetV1,
 } from './types.ts';
 
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -59,6 +62,24 @@ export function parseBodyParagraphTarget(value: unknown): RhwpBodyParagraphTarge
   return target as unknown as RhwpBodyParagraphTargetV1;
 }
 
+export function parseTableCellTextTarget(value: unknown): RhwpTableCellTextTargetV1 {
+  const target = record(value, 'target');
+  exactKeys(
+    target,
+    ['kind', 'section', 'parentPara', 'controlIndex', 'cellIndex', 'cellParagraph'],
+    'target',
+  );
+  if (target.kind !== 'table_cell_text') {
+    throw new DocumentAgentError('INVALID_COMMAND', 'target.kind는 table_cell_text여야 합니다.');
+  }
+  safeInteger(target.section, 0, 'target.section');
+  safeInteger(target.parentPara, 0, 'target.parentPara');
+  safeInteger(target.controlIndex, 0, 'target.controlIndex');
+  safeInteger(target.cellIndex, 0, 'target.cellIndex');
+  safeInteger(target.cellParagraph, 0, 'target.cellParagraph');
+  return target as unknown as RhwpTableCellTextTargetV1;
+}
+
 export function parseApplyTextCommand(value: unknown): RhwpApplyTextCommandV1 {
   const command = record(value, 'command');
   exactKeys(command, [
@@ -87,6 +108,37 @@ export function parseApplyTextCommand(value: unknown): RhwpApplyTextCommandV1 {
   return { ...command, target } as unknown as RhwpApplyTextCommandV1;
 }
 
+export function parseApplyFieldCommand(value: unknown): RhwpApplyFieldCommandV1 {
+  const command = record(value, 'command');
+  exactKeys(command, [
+    'schemaVersion', 'commandId', 'expectedDocumentEpoch', 'expectedChangeSeq',
+    'expectedDocumentSha256', 'target', 'expectedBeforeSha256',
+    'expectedFormatSha256', 'expectedAdjacentContextSha256', 'replacement',
+  ], 'command');
+  if (command.schemaVersion !== 1) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'schemaVersion은 1이어야 합니다.');
+  }
+  commandId(command.commandId);
+  safeInteger(command.expectedDocumentEpoch, 1, 'expectedDocumentEpoch');
+  safeInteger(command.expectedChangeSeq, 0, 'expectedChangeSeq');
+  digest(command.expectedDocumentSha256, 'expectedDocumentSha256');
+  const target = parseTableCellTextTarget(command.target);
+  digest(command.expectedBeforeSha256, 'expectedBeforeSha256');
+  digest(command.expectedFormatSha256, 'expectedFormatSha256');
+  digest(command.expectedAdjacentContextSha256, 'expectedAdjacentContextSha256');
+  if (typeof command.replacement !== 'string'
+      || Array.from(command.replacement).length > 4000) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'replacement는 4000자 이하 문자열이어야 합니다.');
+  }
+  if (/[^\S\r\n]*[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/u.test(command.replacement)) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'replacement에 control 문자를 넣을 수 없습니다.');
+  }
+  if (/\r|\n/u.test(command.replacement)) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'atomic text field에는 줄바꿈을 넣을 수 없습니다.');
+  }
+  return { ...command, target } as unknown as RhwpApplyFieldCommandV1;
+}
+
 export function parseRevertTextCommand(value: unknown): RhwpRevertTextCommandV1 {
   const command = record(value, 'command');
   exactKeys(command, [
@@ -102,6 +154,10 @@ export function parseRevertTextCommand(value: unknown): RhwpRevertTextCommandV1 
   digest(command.expectedAfterDocumentSha256, 'expectedAfterDocumentSha256');
   digest(command.expectedAfterSha256, 'expectedAfterSha256');
   return command as unknown as RhwpRevertTextCommandV1;
+}
+
+export function parseRevertFieldCommand(value: unknown): RhwpRevertFieldCommandV1 {
+  return parseRevertTextCommand(value) as RhwpRevertFieldCommandV1;
 }
 
 export function assertEmptyParams(value: Record<string, unknown>, label: string): void {

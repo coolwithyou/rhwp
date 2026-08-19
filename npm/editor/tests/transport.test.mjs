@@ -20,6 +20,9 @@ test('EditorTransport는 exact origin의 v1 port로 binary를 caller detach 없�
         'selection-context-v1',
         'document-agent-command-v1',
         'target-navigation-v1',
+        'field-target-navigation-v1',
+        'field-agent-command-v1',
+        'field-selection-events-v1',
         'document-change-events-v1',
       ]);
       const server = ports[0];
@@ -195,6 +198,43 @@ test('EditorTransport는 bound v1 session의 documentChanged event만 전달한�
   await transport.connect();
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(received, [{ changeSeq: 2 }]);
+  transport.destroy();
+  server.close();
+});
+
+test('EditorTransport는 event별 capability가 맞는 fieldSelectionChanged만 전달한다', async () => {
+  let server;
+  const contentWindow = {
+    postMessage(message, _targetOrigin, ports) {
+      server = ports[0];
+      server.start();
+      server.postMessage({
+        type: 'rhwp-connected', version: 1, sessionId: message.sessionId,
+        capabilities: ['transferable-array-buffer', 'field-selection-events-v1'],
+      });
+      queueMicrotask(() => {
+        server.postMessage({
+          type: 'rhwp-event', version: 1, sessionId: message.sessionId,
+          event: 'documentChanged', payload: { changeSeq: 1 },
+        });
+        server.postMessage({
+          type: 'rhwp-event', version: 1, sessionId: message.sessionId,
+          event: 'fieldSelectionChanged', payload: { changeSeq: 2 },
+        });
+      });
+    },
+  };
+  const transport = new EditorTransport(
+    { contentWindow },
+    'https://studio.example/app',
+    { window: { addEventListener() {}, removeEventListener() {} } },
+  );
+  const received = [];
+  transport.on('documentChanged', payload => received.push(['document', payload]));
+  transport.on('fieldSelectionChanged', payload => received.push(['field', payload]));
+  await transport.connect();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(received, [['field', { changeSeq: 2 }]]);
   transport.destroy();
   server.close();
 });

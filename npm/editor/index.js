@@ -12,13 +12,18 @@
 import { EditorTransport } from './transport.js';
 import {
   assertCapability,
+  validateApplyFieldCommand,
   validateApplyTextCommand,
   validateBodyParagraphTarget,
   validateDocumentState,
   validateDocumentChangedEvent,
   validateFocusTargetResult,
+  validateFieldCommandReceipt,
+  validateFieldSelectionContext,
+  validateRevertFieldCommand,
   validateRevertTextCommand,
   validateSelectionContext,
+  validateTableCellTextTarget,
   validateTextCommandReceipt,
 } from './document-agent-contract.js';
 
@@ -100,6 +105,8 @@ export class RhwpEditor {
     this._transport = transport;
     this._documentChangedListeners = new Set();
     this._offDocumentChanged = null;
+    this._fieldSelectionChangedListeners = new Set();
+    this._offFieldSelectionChanged = null;
     this._lastDocumentEpoch = null;
     this._lastDocumentChangeSeq = null;
   }
@@ -293,6 +300,16 @@ export class RhwpEditor {
     return selection;
   }
 
+  /** 현재 캐럿의 exact table cell target을 반환합니다. */
+  async getFieldSelectionContext() {
+    assertCapability(this._transport, 'field-selection-events-v1');
+    const selection = validateFieldSelectionContext(
+      await this._request('getFieldSelectionContext'),
+    );
+    this._rememberDocumentVersion(selection.documentEpoch, selection.changeSeq);
+    return selection;
+  }
+
   /** exact preimage fence를 검증하고 한 Studio 트랜잭션으로 문단 전체를 교체합니다. */
   async applyTextCommand(command) {
     assertCapability(this._transport, 'document-agent-command-v1');
@@ -324,6 +341,37 @@ export class RhwpEditor {
     }));
   }
 
+  /** exact table cell text target으로 캐럿과 뷰포트를 이동합니다. */
+  async focusFieldTarget(target) {
+    assertCapability(this._transport, 'field-target-navigation-v1');
+    const validTarget = validateTableCellTextTarget(target);
+    return validateFocusTargetResult(await this._request('focusFieldTarget', {
+      target: validTarget,
+    }));
+  }
+
+  /** exact table cell field를 서버 승인 binding으로 한 트랜잭션에서 교체합니다. */
+  async applyFieldCommand(command) {
+    assertCapability(this._transport, 'field-agent-command-v1');
+    const validCommand = validateApplyFieldCommand(command);
+    const receipt = validateFieldCommandReceipt(await this._request('applyFieldCommand', {
+      command: validCommand,
+    }));
+    this._rememberDocumentVersion(receipt.documentEpoch, receipt.afterChangeSeq);
+    return receipt;
+  }
+
+  /** 같은 Studio 세션의 가장 최근 exact field command를 되돌립니다. */
+  async revertFieldCommand(command) {
+    assertCapability(this._transport, 'field-agent-command-v1');
+    const validCommand = validateRevertFieldCommand(command);
+    const receipt = validateFieldCommandReceipt(await this._request('revertFieldCommand', {
+      command: validCommand,
+    }));
+    this._rememberDocumentVersion(receipt.documentEpoch, receipt.afterChangeSeq);
+    return receipt;
+  }
+
   /** agent apply/revert가 commit된 뒤 strict v1 변경 이벤트를 구독합니다. */
   onDocumentChanged(listener) {
     assertCapability(this._transport, 'document-change-events-v1');
@@ -349,6 +397,34 @@ export class RhwpEditor {
       if (this._documentChangedListeners.size === 0) {
         this._offDocumentChanged?.();
         this._offDocumentChanged = null;
+      }
+    };
+  }
+
+  /** 사용자가 Studio에서 표 셀을 이동할 때 strict v1 field selection을 구독합니다. */
+  onFieldSelectionChanged(listener) {
+    assertCapability(this._transport, 'field-selection-events-v1');
+    if (typeof listener !== 'function') throw new TypeError('listener must be a function');
+    this._fieldSelectionChangedListeners.add(listener);
+    if (!this._offFieldSelectionChanged) {
+      this._offFieldSelectionChanged = this._transport.on('fieldSelectionChanged', (payload) => {
+        let event;
+        try {
+          event = validateFieldSelectionContext(payload);
+        } catch {
+          return;
+        }
+        this._rememberDocumentVersion(event.documentEpoch, event.changeSeq);
+        for (const subscriber of this._fieldSelectionChangedListeners) {
+          try { subscriber(event); } catch { /* 한 listener가 다른 listener를 막지 않는다. */ }
+        }
+      });
+    }
+    return () => {
+      this._fieldSelectionChangedListeners.delete(listener);
+      if (this._fieldSelectionChangedListeners.size === 0) {
+        this._offFieldSelectionChanged?.();
+        this._offFieldSelectionChanged = null;
       }
     };
   }
@@ -463,6 +539,9 @@ export class RhwpEditor {
     this._offDocumentChanged?.();
     this._offDocumentChanged = null;
     this._documentChangedListeners.clear();
+    this._offFieldSelectionChanged?.();
+    this._offFieldSelectionChanged = null;
+    this._fieldSelectionChangedListeners.clear();
     this._transport.destroy();
     this._iframe.remove();
   }

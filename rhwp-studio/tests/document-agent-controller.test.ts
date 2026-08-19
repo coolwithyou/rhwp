@@ -4,11 +4,13 @@ import assert from 'node:assert/strict';
 import { EventBus } from '../src/core/event-bus.ts';
 import {
   DocumentAgentController,
+  collectFieldTargetEvidence,
   collectTargetEvidence,
   type DocumentAgentWasm,
   type DocumentAgentInput,
 } from '../src/document-agent/controller.ts';
 import type {
+  RhwpApplyFieldCommandV1,
   RhwpApplyTextCommandV1,
   RhwpBodyParagraphTargetV1,
 } from '../src/document-agent/types.ts';
@@ -22,6 +24,8 @@ type Paragraph = {
   fields: Array<[number, number]>;
 };
 
+type CellParagraph = Pick<Paragraph, 'text' | 'paraShapeId' | 'charShapeIds'>;
+
 const encoder = new TextEncoder();
 
 class FakeWasm implements DocumentAgentWasm {
@@ -33,6 +37,10 @@ class FakeWasm implements DocumentAgentWasm {
     paragraph('기존 문단'),
     paragraph('뒤 문단'),
   ]];
+  cells: CellParagraph[][] = [
+    [cellParagraph('항목명')],
+    [cellParagraph('기존 값')],
+  ];
   replacementPageCount: number | null = null;
 
   getSourceFormat() { return this.sourceFormat; }
@@ -66,6 +74,26 @@ class FakeWasm implements DocumentAgentWasm {
       ? { inField: true, startCharIdx: field[0], endCharIdx: field[1] }
       : { inField: false };
   }
+  getTextInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number, count: number) {
+    return Array.from(this.cells[cellIndex][cellPara].text).slice(offset, offset + count).join('');
+  }
+  getCellParagraphLength(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number) {
+    return Array.from(this.cells[cellIndex][cellPara].text).length;
+  }
+  getCellParagraphCount(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number) {
+    return this.cells[cellIndex]?.length ?? 0;
+  }
+  getCellCharPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
+    const paragraph = this.cells[cellIndex][cellPara];
+    return { charShapeId: paragraph.charShapeIds[Math.min(offset, paragraph.charShapeIds.length - 1)] ?? 4 };
+  }
+  getCellParaPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number) {
+    return { paraShapeId: this.cells[cellIndex][cellPara].paraShapeId };
+  }
+  getCellOwnProperties(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number) {
+    return { width: 100 + cellIndex, fillColor: '#ffffff' };
+  }
+  getTableDimensions() { return { rowCount: 1, colCount: 2, cellCount: 2 }; }
   replaceText(section: number, paragraphIndex: number, offset: number, length: number, text: string) {
     const para = this.paragraphs[section][paragraphIndex];
     if (offset !== 0 || length !== Array.from(para.text).length) return { ok: false };
@@ -84,15 +112,46 @@ class FakeWasm implements DocumentAgentWasm {
     this.paragraphs[section][paragraphIndex].paraShapeId = id;
     return '{}';
   }
+  replaceTextInCellDeferredPagination(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number, deleteCount: number, text: string) {
+    const paragraph = this.cells[cellIndex][cellPara];
+    const chars = Array.from(paragraph.text);
+    chars.splice(offset, deleteCount, ...Array.from(text));
+    paragraph.text = chars.join('');
+    paragraph.charShapeIds = Array(Math.max(chars.length, 1)).fill(paragraph.charShapeIds[0] ?? 4);
+    if (this.replacementPageCount !== null) this.pageCount = this.replacementPageCount;
+    return { ok: true, charOffset: offset + Array.from(text).length, paginationDeferred: true };
+  }
+  insertTextInCellDeferredPagination(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, offset: number, text: string) {
+    return this.replaceTextInCellDeferredPagination(section, parentPara, controlIndex, cellIndex, cellPara, offset, 0, text);
+  }
+  deleteTextInCellDeferredPagination(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, offset: number, count: number) {
+    return this.replaceTextInCellDeferredPagination(section, parentPara, controlIndex, cellIndex, cellPara, offset, count, '');
+  }
+  setCharShapeIdInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, start: number, end: number, id: number) {
+    const paragraph = this.cells[cellIndex][cellPara];
+    for (let index = start; index < end; index += 1) paragraph.charShapeIds[index] = id;
+    return '{}';
+  }
+  setCellParaShapeId(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, id: number) {
+    this.cells[cellIndex][cellPara].paraShapeId = id;
+    return '{}';
+  }
+  beginDeferredPagination() {}
+  flushDeferredPagination() {}
+  cancelDeferredPagination() {}
   getPageOfPosition() { return { ok: true, page: 1 }; }
+  exportHwp() { return this.borrowDocumentHandle().exportHwp(); }
+  exportHwpx() { return this.borrowDocumentHandle().exportHwpx(); }
   borrowDocumentHandle() {
     return {
       exportHwp: () => encoder.encode(JSON.stringify({
         paragraphs: this.paragraphs,
+        cells: this.cells,
         pageCount: this.pageCount,
       })),
       exportHwpx: () => encoder.encode(JSON.stringify({
         paragraphs: this.paragraphs,
+        cells: this.cells,
         pageCount: this.pageCount,
       })),
     };
@@ -102,11 +161,13 @@ class FakeWasm implements DocumentAgentWasm {
     return {
       pageCount: this.pageCount,
       paragraphs: structuredClone(this.paragraphs),
+      cells: structuredClone(this.cells),
     };
   }
   restoreState(snapshot: ReturnType<FakeWasm['cloneState']>) {
     this.pageCount = snapshot.pageCount;
     this.paragraphs = structuredClone(snapshot.paragraphs);
+    this.cells = structuredClone(snapshot.cells);
   }
 }
 
@@ -160,6 +221,24 @@ class FakeInput implements DocumentAgentInput {
     };
     return true;
   }
+  focusTableCellText(
+    section: number,
+    parentPara: number,
+    controlIndex: number,
+    cellIndex: number,
+    cellParagraph: number,
+  ) {
+    this.position = {
+      sectionIndex: section,
+      paragraphIndex: cellParagraph,
+      charOffset: 0,
+      parentParaIndex: parentPara,
+      controlIndex,
+      cellIndex,
+      cellParaIndex: cellParagraph,
+    };
+    return { focused: true, page: 3 };
+  }
 }
 
 function paragraph(text: string): Paragraph {
@@ -170,6 +249,14 @@ function paragraph(text: string): Paragraph {
     charShapeIds: Array(Math.max(Array.from(text).length, 1)).fill(4),
     controls: [],
     fields: [],
+  };
+}
+
+function cellParagraph(text: string): CellParagraph {
+  return {
+    text,
+    paraShapeId: 6,
+    charShapeIds: Array(Math.max(Array.from(text).length, 1)).fill(7),
   };
 }
 
@@ -220,6 +307,63 @@ function applyCommand(
     replacement,
   };
 }
+
+function fieldCommand(
+  controller: DocumentAgentController,
+  wasm: FakeWasm,
+  replacement = '새 필드 값',
+): RhwpApplyFieldCommandV1 {
+  const state = controller.getDocumentState();
+  const exactTarget = {
+    kind: 'table_cell_text' as const,
+    section: 0,
+    parentPara: 1,
+    controlIndex: 0,
+    cellIndex: 1,
+    cellParagraph: 0,
+  };
+  const evidence = collectFieldTargetEvidence(wasm, exactTarget);
+  return {
+    schemaVersion: 1,
+    commandId: 'field-cmd-1',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target: exactTarget,
+    expectedBeforeSha256: evidence.textSha256,
+    expectedFormatSha256: evidence.formatSha256,
+    expectedAdjacentContextSha256: evidence.adjacentContextSha256,
+    replacement,
+  };
+}
+
+test('field apply/revert는 exact 셀만 한 트랜잭션으로 변경하고 복원한다', async () => {
+  const { controller, wasm, input, events } = harness();
+  const replacement = 'AI 기반 사업계획서 작성 서비스';
+  const command = fieldCommand(controller, wasm, replacement);
+  const labelBefore = structuredClone(wasm.cells[0]);
+
+  const applied = await controller.applyFieldCommand(command);
+  assert.equal(wasm.cells[1][0].text, replacement);
+  assert.deepEqual(wasm.cells[0], labelBefore);
+  assert.equal(input.transactions, 1);
+  assert.equal(applied.afterChangeSeq, 1);
+  assert.equal((events[0] as { reason: string }).reason, 'field_agent_apply');
+
+  const reverted = await controller.revertFieldCommand({
+    schemaVersion: 1,
+    commandId: command.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  });
+  assert.equal(wasm.cells[1][0].text, '기존 값');
+  assert.deepEqual(wasm.cells[0], labelBefore);
+  assert.equal(input.transactions, 2);
+  assert.equal(reverted.afterChangeSeq, 2);
+  assert.equal((events[1] as { reason: string }).reason, 'field_agent_revert');
+});
 
 test('apply/revert는 각각 한 트랜잭션·changeSeq 1회·strict receipt로 종결된다', async () => {
   const { controller, wasm, input, events } = harness();
@@ -412,5 +556,67 @@ test('selection context와 focus는 body paragraph만 exact하게 노출한다',
     sectionIndex: 0,
     paragraphIndex: 1,
     charOffset: 0,
+  });
+});
+
+test('field target focus는 exact 표 셀 좌표로 이동하고 mutation을 만들지 않는다', () => {
+  const { controller, input, events } = harness();
+  const beforeTransactions = input.transactions;
+  const fieldTarget = {
+    kind: 'table_cell_text' as const,
+    section: 0,
+    parentPara: 5,
+    controlIndex: 1,
+    cellIndex: 3,
+    cellParagraph: 0,
+  };
+  assert.deepEqual(controller.focusFieldTarget(fieldTarget), { focused: true, page: 3 });
+  assert.deepEqual(input.position, {
+    sectionIndex: 0,
+    paragraphIndex: 0,
+    charOffset: 0,
+    parentParaIndex: 5,
+    controlIndex: 1,
+    cellIndex: 3,
+    cellParaIndex: 0,
+  });
+  assert.equal(input.transactions, beforeTransactions);
+  assert.equal(events.length, 0);
+});
+
+test('field selection context는 현재 표 셀을 exact target으로 노출하고 본문에서는 null이다', () => {
+  const { controller, input } = harness();
+  assert.deepEqual(controller.getFieldSelectionContext(), {
+    schemaVersion: 1,
+    documentEpoch: 1,
+    changeSeq: 0,
+    page: 2,
+    editable: false,
+    target: null,
+  });
+
+  input.position = {
+    sectionIndex: 0,
+    paragraphIndex: 0,
+    charOffset: 0,
+    parentParaIndex: 1,
+    controlIndex: 0,
+    cellIndex: 1,
+    cellParaIndex: 0,
+  };
+  assert.deepEqual(controller.getFieldSelectionContext(), {
+    schemaVersion: 1,
+    documentEpoch: 1,
+    changeSeq: 0,
+    page: 2,
+    editable: true,
+    target: {
+      kind: 'table_cell_text',
+      section: 0,
+      parentPara: 1,
+      controlIndex: 0,
+      cellIndex: 1,
+      cellParagraph: 0,
+    },
   });
 });

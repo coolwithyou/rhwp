@@ -18,6 +18,17 @@ function target() {
   };
 }
 
+function fieldTarget() {
+  return {
+    kind: 'table_cell_text',
+    section: 0,
+    parentPara: 4,
+    controlIndex: 1,
+    cellIndex: 3,
+    cellParagraph: 0,
+  };
+}
+
 function state() {
   return {
     schemaVersion: 1,
@@ -40,6 +51,17 @@ function selection() {
     collapsed: true,
     target: target(),
     selectedTextSha256: null,
+  };
+}
+
+function fieldSelection(selectedTarget = fieldTarget()) {
+  return {
+    schemaVersion: 1,
+    documentEpoch: 3,
+    changeSeq: 11,
+    page: 2,
+    editable: selectedTarget !== null,
+    target: selectedTarget,
   };
 }
 
@@ -69,6 +91,14 @@ function revertCommand() {
   };
 }
 
+function applyFieldCommand() {
+  return { ...applyCommand(), commandId: 'field-001', target: fieldTarget(), replacement: '주식회사 노튼' };
+}
+
+function revertFieldCommand() {
+  return { ...revertCommand(), commandId: 'field-001' };
+}
+
 function receipt(operation = 'apply') {
   return {
     schemaVersion: 1,
@@ -89,11 +119,18 @@ function receipt(operation = 'apply') {
   };
 }
 
+function fieldReceipt(operation = 'apply') {
+  return { ...receipt(operation), commandId: 'field-001', target: fieldTarget() };
+}
+
 function editorHarness(results, capabilities = [
   'document-state-v1',
   'selection-context-v1',
   'document-agent-command-v1',
   'target-navigation-v1',
+  'field-target-navigation-v1',
+  'field-agent-command-v1',
+  'field-selection-events-v1',
   'document-change-events-v1',
 ]) {
   const requests = [];
@@ -122,24 +159,36 @@ test('문서 에이전트 공개 API는 exact RPC 메서드와 파라미터를 �
   const results = {
     getDocumentState: state(),
     getSelectionContext: selection(),
+    getFieldSelectionContext: fieldSelection(),
     applyTextCommand: receipt('apply'),
     revertTextCommand: receipt('revert'),
     focusTarget: { focused: true, page: 2 },
+    focusFieldTarget: { focused: true, page: 3 },
+    applyFieldCommand: fieldReceipt('apply'),
+    revertFieldCommand: fieldReceipt('revert'),
   };
   const { editor, requests } = editorHarness(results);
 
   assert.deepEqual(await editor.getDocumentState(), state());
   assert.deepEqual(await editor.getSelectionContext(), selection());
+  assert.deepEqual(await editor.getFieldSelectionContext(), fieldSelection());
   assert.deepEqual(await editor.applyTextCommand(applyCommand()), receipt('apply'));
   assert.deepEqual(await editor.revertTextCommand(revertCommand()), receipt('revert'));
   assert.deepEqual(await editor.focusTarget(target()), { focused: true, page: 2 });
+  assert.deepEqual(await editor.focusFieldTarget(fieldTarget()), { focused: true, page: 3 });
+  assert.deepEqual(await editor.applyFieldCommand(applyFieldCommand()), fieldReceipt('apply'));
+  assert.deepEqual(await editor.revertFieldCommand(revertFieldCommand()), fieldReceipt('revert'));
 
   assert.deepEqual(requests, [
     { method: 'getDocumentState', params: {} },
     { method: 'getSelectionContext', params: {} },
+    { method: 'getFieldSelectionContext', params: {} },
     { method: 'applyTextCommand', params: { command: applyCommand() } },
     { method: 'revertTextCommand', params: { command: revertCommand() } },
     { method: 'focusTarget', params: { target: target() } },
+    { method: 'focusFieldTarget', params: { target: fieldTarget() } },
+    { method: 'applyFieldCommand', params: { command: applyFieldCommand() } },
+    { method: 'revertFieldCommand', params: { command: revertFieldCommand() } },
   ]);
 });
 
@@ -149,9 +198,13 @@ test('문서 에이전트 공개 API는 capability가 없으면 요청 전에 �
   for (const call of [
     () => editor.getDocumentState(),
     () => editor.getSelectionContext(),
+    () => editor.getFieldSelectionContext(),
     () => editor.applyTextCommand(applyCommand()),
     () => editor.revertTextCommand(revertCommand()),
     () => editor.focusTarget(target()),
+    () => editor.focusFieldTarget(fieldTarget()),
+    () => editor.applyFieldCommand(applyFieldCommand()),
+    () => editor.revertFieldCommand(revertFieldCommand()),
   ]) {
     await assert.rejects(call, (error) => error.code === 'CAPABILITY_UNSUPPORTED');
   }
@@ -177,19 +230,35 @@ test('문서 에이전트 공개 API는 extra key와 잘못된 SHA를 요청 전
     () => editor.focusTarget({ ...target(), charOffset: 1 }),
     (error) => error.code === 'INVALID_COMMAND',
   );
+  await assert.rejects(
+    () => editor.focusFieldTarget({ ...fieldTarget(), cellIndex: -1 }),
+    (error) => error.code === 'INVALID_COMMAND',
+  );
+  await assert.rejects(
+    () => editor.applyFieldCommand({ ...applyFieldCommand(), replacement: '두 줄\n금지' }),
+    (error) => error.code === 'INVALID_COMMAND',
+  );
+  await assert.rejects(
+    () => editor.applyFieldCommand({ ...applyFieldCommand(), target: { ...fieldTarget(), page: 1 } }),
+    (error) => error.code === 'INVALID_COMMAND',
+  );
   assert.deepEqual(requests, []);
 });
 
 test('문서 에이전트 공개 API는 malformed 응답을 명시적으로 거부한다', async () => {
   const malformedState = { ...state(), pageCount: Number.NaN };
   const malformedSelection = { ...selection(), page: 0 };
+  const malformedFieldSelection = { ...fieldSelection(), unexpected: true };
   const malformedReceipt = { ...receipt(), extra: true };
   const malformedFocus = { focused: true, page: 1, extra: true };
   const { editor } = editorHarness({
     getDocumentState: malformedState,
     getSelectionContext: malformedSelection,
+    getFieldSelectionContext: malformedFieldSelection,
     applyTextCommand: malformedReceipt,
     focusTarget: malformedFocus,
+    focusFieldTarget: malformedFocus,
+    applyFieldCommand: malformedReceipt,
   });
 
   await assert.rejects(
@@ -201,11 +270,23 @@ test('문서 에이전트 공개 API는 malformed 응답을 명시적으로 거�
     (error) => error.code === 'INVALID_RESPONSE',
   );
   await assert.rejects(
+    () => editor.getFieldSelectionContext(),
+    (error) => error.code === 'INVALID_RESPONSE',
+  );
+  await assert.rejects(
     () => editor.applyTextCommand(applyCommand()),
     (error) => error.code === 'INVALID_RESPONSE',
   );
   await assert.rejects(
     () => editor.focusTarget(target()),
+    (error) => error.code === 'INVALID_RESPONSE',
+  );
+  await assert.rejects(
+    () => editor.focusFieldTarget(fieldTarget()),
+    (error) => error.code === 'INVALID_RESPONSE',
+  );
+  await assert.rejects(
+    () => editor.applyFieldCommand(applyFieldCommand()),
     (error) => error.code === 'INVALID_RESPONSE',
   );
 });
@@ -223,6 +304,9 @@ test('문서 변경 이벤트는 capability와 strict v1 payload를 사용한다
   };
   emit('documentChanged', event);
   assert.deepEqual(received, [event]);
+  const fieldEvent = { ...event, reason: 'field_agent_apply', changeSeq: 13, commandId: 'field-001' };
+  emit('documentChanged', fieldEvent);
+  assert.deepEqual(received, [event, fieldEvent]);
   off();
   assert.equal(listeners.has('documentChanged'), false);
 
@@ -254,4 +338,27 @@ test('문서 변경 이벤트는 모든 listener에 한 번 전달하고 stale e
 
   assert.deepEqual(first, [2, 3]);
   assert.deepEqual(second, [2, 3]);
+});
+
+test('field selection 이벤트는 같은 revision의 서로 다른 셀 이동도 모두 전달한다', () => {
+  const { editor, emit, listeners } = editorHarness({});
+  const received = [];
+  const off = editor.onFieldSelectionChanged(
+    event => received.push(event.target?.cellIndex ?? null),
+  );
+
+  emit('fieldSelectionChanged', fieldSelection({ ...fieldTarget(), cellIndex: 3 }));
+  emit('fieldSelectionChanged', fieldSelection({ ...fieldTarget(), cellIndex: 5 }));
+  emit('fieldSelectionChanged', fieldSelection(null));
+  emit('fieldSelectionChanged', { ...fieldSelection(), unexpected: true });
+
+  assert.deepEqual(received, [3, 5, null]);
+  off();
+  assert.equal(listeners.has('fieldSelectionChanged'), false);
+
+  const unsupported = editorHarness({}, []).editor;
+  assert.throws(
+    () => unsupported.onFieldSelectionChanged(() => {}),
+    (error) => error.code === 'CAPABILITY_UNSUPPORTED',
+  );
 });
