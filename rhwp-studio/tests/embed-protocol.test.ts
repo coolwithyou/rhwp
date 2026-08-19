@@ -166,6 +166,12 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     cellIndex: 3,
     cellParagraph: 0,
   };
+  const formFieldTarget = {
+    kind: 'form_text' as const,
+    section: 0,
+    paragraph: 5,
+    fieldId: 17,
+  };
   const apply = {
     schemaVersion: 1 as const,
     commandId: 'cmd-1',
@@ -206,6 +212,8 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
   await routeEmbedRequest('focusTarget', { target }, handlers);
   await routeEmbedRequest('focusFieldTarget', { target: fieldTarget }, handlers);
   await routeEmbedRequest('applyFieldCommand', { command: { ...apply, target: fieldTarget } }, handlers);
+  await routeEmbedRequest('focusFieldTarget', { target: formFieldTarget }, handlers);
+  await routeEmbedRequest('applyFieldCommand', { command: { ...apply, target: formFieldTarget } }, handlers);
   await routeEmbedRequest('revertFieldCommand', { command: revert }, handlers);
   assert.deepEqual(calls, [
     { method: 'state' },
@@ -216,6 +224,8 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     { method: 'focus', value: target },
     { method: 'focus-field', value: fieldTarget },
     { method: 'apply-field', value: { ...apply, target: fieldTarget } },
+    { method: 'focus-field', value: formFieldTarget },
+    { method: 'apply-field', value: { ...apply, target: formFieldTarget } },
     { method: 'revert-field', value: revert },
   ]);
 
@@ -231,7 +241,10 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     ['focusTarget', { target: { ...target, length: 4001 } }],
     ['focusFieldTarget', { target: { ...fieldTarget, cellIndex: -1 } }],
     ['focusFieldTarget', { target: { ...fieldTarget, page: 1 } }],
+    ['focusFieldTarget', { target: { ...formFieldTarget, fieldId: -1 } }],
+    ['focusFieldTarget', { target: { ...formFieldTarget, extra: true } }],
     ['applyFieldCommand', { command: { ...apply, target: { ...fieldTarget, cellIndex: -1 } } }],
+    ['applyFieldCommand', { command: { ...apply, target: { ...formFieldTarget, paragraph: -1 } } }],
     ['applyFieldCommand', { command: { ...apply, target: fieldTarget, replacement: 'line1\nline2' } }],
     ['revertFieldCommand', { command: { ...revert, expectedAfterSha256: 'bad' } }],
   ] as const) {

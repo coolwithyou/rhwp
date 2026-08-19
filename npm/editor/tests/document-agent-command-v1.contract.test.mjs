@@ -29,6 +29,15 @@ function fieldTarget() {
   };
 }
 
+function formFieldTarget() {
+  return {
+    kind: 'form_text',
+    section: 0,
+    paragraph: 5,
+    fieldId: 17,
+  };
+}
+
 function state() {
   return {
     schemaVersion: 1,
@@ -95,6 +104,15 @@ function applyFieldCommand() {
   return { ...applyCommand(), commandId: 'field-001', target: fieldTarget(), replacement: '주식회사 노튼' };
 }
 
+function applyFormFieldCommand() {
+  return {
+    ...applyCommand(),
+    commandId: 'form-field-001',
+    target: formFieldTarget(),
+    replacement: '주식회사 노튼',
+  };
+}
+
 function revertFieldCommand() {
   return { ...revertCommand(), commandId: 'field-001' };
 }
@@ -121,6 +139,14 @@ function receipt(operation = 'apply') {
 
 function fieldReceipt(operation = 'apply') {
   return { ...receipt(operation), commandId: 'field-001', target: fieldTarget() };
+}
+
+function formFieldReceipt(operation = 'apply') {
+  return {
+    ...receipt(operation),
+    commandId: 'form-field-001',
+    target: formFieldTarget(),
+  };
 }
 
 function editorHarness(results, capabilities = [
@@ -192,6 +218,24 @@ test('문서 에이전트 공개 API는 exact RPC 메서드와 파라미터를 �
   ]);
 });
 
+test('문서 에이전트 공개 API는 exact 본문 누름틀 target을 전달하고 검증한다', async () => {
+  const results = {
+    getFieldSelectionContext: fieldSelection(formFieldTarget()),
+    focusFieldTarget: { focused: true, page: 4 },
+    applyFieldCommand: formFieldReceipt('apply'),
+  };
+  const { editor, requests } = editorHarness(results);
+
+  assert.deepEqual(await editor.getFieldSelectionContext(), fieldSelection(formFieldTarget()));
+  assert.deepEqual(await editor.focusFieldTarget(formFieldTarget()), { focused: true, page: 4 });
+  assert.deepEqual(await editor.applyFieldCommand(applyFormFieldCommand()), formFieldReceipt('apply'));
+  assert.deepEqual(requests, [
+    { method: 'getFieldSelectionContext', params: {} },
+    { method: 'focusFieldTarget', params: { target: formFieldTarget() } },
+    { method: 'applyFieldCommand', params: { command: applyFormFieldCommand() } },
+  ]);
+});
+
 test('문서 에이전트 공개 API는 capability가 없으면 요청 전에 실패한다', async () => {
   const { editor, requests } = editorHarness({}, []);
 
@@ -240,6 +284,14 @@ test('문서 에이전트 공개 API는 extra key와 잘못된 SHA를 요청 전
   );
   await assert.rejects(
     () => editor.applyFieldCommand({ ...applyFieldCommand(), target: { ...fieldTarget(), page: 1 } }),
+    (error) => error.code === 'INVALID_COMMAND',
+  );
+  await assert.rejects(
+    () => editor.focusFieldTarget({ ...formFieldTarget(), fieldId: -1 }),
+    (error) => error.code === 'INVALID_COMMAND',
+  );
+  await assert.rejects(
+    () => editor.applyFieldCommand({ ...applyFormFieldCommand(), target: { ...formFieldTarget(), extra: true } }),
     (error) => error.code === 'INVALID_COMMAND',
   );
   assert.deepEqual(requests, []);

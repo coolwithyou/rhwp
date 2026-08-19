@@ -316,6 +316,8 @@ export class InputHandler {
   private editMode: EditorEditMode = 'normal';
   /** 마지막 셀 키 (눈금자 셀 bbox 중복 조회 방지) */
   private lastCellKey: string | null = null;
+  /** 공개 fieldSelectionChanged event의 마지막 exact target key. */
+  private lastDocumentAgentFieldKey: string | null = null;
   /** [#4162] 선택 없이 지정한 글자 서식 — 다음 삽입 런에 적용 예약(캐럿 대기 글자 모양) */
   private pendingCharShape: Partial<CharProperties> | null = null;
   /** pendingCharShape 를 예약·연장한 캐럿 위치. 여기서 벗어나면(진짜 이동) 예약을 버린다. */
@@ -2450,6 +2452,26 @@ export class InputHandler {
       const pos = this.cursor.getPosition();
       const inFootnote = this.cursor.isInFootnote();
       const inCell = !inFootnote && pos.parentParaIndex !== undefined;
+      let documentAgentFieldKey: string | null = inCell
+        ? `cell:${pos.sectionIndex}:${pos.parentParaIndex}:${pos.controlIndex}:${pos.cellIndex}:${pos.cellParaIndex}`
+        : null;
+      if (!inCell && !inFootnote) {
+        try {
+          const field = this.wasm.getFieldInfoAt(pos);
+          if (field.inField
+              && field.fieldType === 'clickhere'
+              && Number.isSafeInteger(field.fieldId)
+              && (field.fieldId as number) >= 0) {
+            documentAgentFieldKey = `form:${pos.sectionIndex}:${pos.paragraphIndex}:${field.fieldId}`;
+          }
+        } catch {
+          documentAgentFieldKey = null;
+        }
+      }
+      if (documentAgentFieldKey !== this.lastDocumentAgentFieldKey) {
+        this.lastDocumentAgentFieldKey = documentAgentFieldKey;
+        this.eventBus.emit('document-agent-field-selection-changed');
+      }
       // 문단 모양 대화상자와 같은 리더를 쓴다. 여기에 갈래를 따로 두면 문맥이 하나 빠져도
       // 컴파일이 통과하고, 실제로 머리말/꼬리말 갈래가 빠져 있었다 — 머리말 편집 중 툴바와
       // 눈금자가 본문 문단 값을 보여줬다(대화상자는 머리말 값을 정확히 읽는데).
@@ -2475,7 +2497,6 @@ export class InputHandler {
         const cellKey = `${pos.sectionIndex}:${pos.parentParaIndex}:${pos.controlIndex}:${pos.cellIndex}:${pos.cellParaIndex}`;
         if (cellKey !== this.lastCellKey) {
           this.lastCellKey = cellKey;
-          this.eventBus.emit('document-agent-field-selection-changed');
           const sec = pos.sectionIndex;
           const ppi = pos.parentParaIndex!;
           const ci = pos.controlIndex!;
@@ -2496,7 +2517,6 @@ export class InputHandler {
         }
       } else if (this.lastCellKey !== null) {
         this.lastCellKey = null;
-        this.eventBus.emit('document-agent-field-selection-changed');
         this.eventBus.emit('cursor-cell-changed', { inCell: false });
       }
     } catch {
@@ -4203,6 +4223,64 @@ export class InputHandler {
       this.cursor.resetPreferredX();
       this.active = true;
       this.updateCaret(true);
+      this.focusTextarea();
+
+      const rect = this.cursor.getRect();
+      if (!rect) return { focused: false, page: 1 };
+      const zoom = this.viewportManager.getZoom();
+      const centerY = this.virtualScroll.getPageOffset(rect.pageIndex) + rect.y * zoom;
+      const maxScrollTop = Math.max(0, this.container.scrollHeight - this.container.clientHeight);
+      this.container.scrollTop = Math.max(
+        0,
+        Math.min(maxScrollTop, centerY - this.container.clientHeight / 2),
+      );
+      return { focused: true, page: rect.pageIndex + 1 };
+    } catch {
+      return { focused: false, page: 1 };
+    }
+  }
+
+  /** current revision의 exact 본문 누름틀 target을 선택한다. 문서 mutation은 발생하지 않는다. */
+  focusFormText(
+    section: number,
+    paragraph: number,
+    fieldId: number,
+  ): { focused: boolean; page: number } {
+    if (![section, paragraph, fieldId]
+      .every(value => Number.isSafeInteger(value) && value >= 0)) {
+      return { focused: false, page: 1 };
+    }
+    try {
+      const matches = this.wasm.getFieldList().filter((field: any) => field.fieldId === fieldId);
+      if (matches.length !== 1) return { focused: false, page: 1 };
+      const field = matches[0];
+      const path = field.location?.path;
+      const rawStartCharIdx = field.startCharIdx;
+      const rawEndCharIdx = field.endCharIdx;
+      if (field.fieldType !== 'clickhere'
+          || field.cellField === true
+          || field.editableInForm !== true
+          || field.location?.sectionIndex !== section
+          || field.location?.paraIndex !== paragraph
+          || (Array.isArray(path) && path.length > 0)
+          || !Number.isSafeInteger(rawStartCharIdx)
+          || !Number.isSafeInteger(rawEndCharIdx)
+          || (rawStartCharIdx as number) < 0
+          || (rawEndCharIdx as number) < (rawStartCharIdx as number)) {
+        return { focused: false, page: 1 };
+      }
+      const startCharIdx = rawStartCharIdx as number;
+      const endCharIdx = rawEndCharIdx as number;
+
+      this.exitFootnoteModeForBodyNavigation();
+      this.cursor.clearSelection();
+      this.cursor.moveTo({ sectionIndex: section, paragraphIndex: paragraph, charOffset: startCharIdx });
+      this.cursor.setAnchor();
+      this.cursor.moveTo({ sectionIndex: section, paragraphIndex: paragraph, charOffset: endCharIdx });
+      this.cursor.resetPreferredX();
+      this.active = true;
+      this.updateCaret(true);
+      this.updateFieldMarkers();
       this.focusTextarea();
 
       const rect = this.cursor.getRect();

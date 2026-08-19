@@ -9,7 +9,7 @@ const EDITOR_MODULE_URL = EDITOR_MODULE_PATH.startsWith('/')
 const VITE_URL = process.env.VITE_URL || 'http://localhost:7700';
 const SAMPLE_FILE = 'biz_plan.hwp';
 
-runTest('field-agent exact table cell HWP apply/reopen/revert gate', async ({ page }) => {
+await runTest('field-agent exact table cell HWP apply/reopen/revert gate', async ({ page }) => {
   await page.goto(`${VITE_URL}/e2e/embed-harness.html`, { waitUntil: 'domcontentloaded' });
 
   const result = await page.evaluate(async ({ editorModuleUrl, sampleFile }) => {
@@ -259,4 +259,154 @@ runTest('field-agent exact table cell HWP apply/reopen/revert gate', async ({ pa
   ]), 'field public document event 순서');
   assert(result.selectionEventMatched, 'field selection event에 exact target 전달');
   assert(result.modalCount === 0, 'field focus/apply/revert 중 경고 modal 0회');
+}, { skipLoadApp: true });
+
+await runTest('field-agent exact form_text HWP apply/reopen/revert gate', async ({ page }) => {
+  await page.goto(`${VITE_URL}/e2e/embed-harness.html`, { waitUntil: 'domcontentloaded' });
+
+  const result = await page.evaluate(async ({ editorModuleUrl }) => {
+    const { createEditor } = await import(editorModuleUrl);
+    const { collectFieldTargetEvidence } = await import('/src/document-agent/controller.ts');
+    const host = document.createElement('div');
+    host.style.cssText = 'width: 100vw; height: 100vh';
+    document.body.replaceChildren(host);
+    const editor = await createEditor(host, {
+      studioUrl: `${location.origin}/`,
+      renderer: 'canvas2d',
+      handshakeTimeoutMs: 10_000,
+    });
+    const bytes = await fetch('/samples/field-01.hwp').then(response => response.arrayBuffer());
+    await editor.loadFile(bytes, 'field-01.hwp', { suppressDialogs: true });
+    const wasm = editor.element.contentWindow.__wasm;
+    if (!wasm) throw new Error('Studio WasmBridge is unavailable');
+    const field = wasm.getFieldList().find(entry =>
+      entry.name === '회사명'
+      && entry.fieldType === 'clickhere'
+      && entry.editableInForm === true
+      && !(entry.location.path?.length));
+    if (!field) throw new Error('safe root form_text field not found');
+    const target = {
+      kind: 'form_text',
+      section: field.location.sectionIndex,
+      paragraph: field.location.paraIndex,
+      fieldId: field.fieldId,
+    };
+    const initialState = await editor.getDocumentState();
+    const before = collectFieldTargetEvidence(wasm, target);
+    const otherField = wasm.getFieldList().find(entry =>
+      entry.fieldId !== field.fieldId
+      && entry.fieldType === 'clickhere'
+      && entry.editableInForm === true
+      && !(entry.location.path?.length));
+    if (!otherField) throw new Error('second root form_text field not found');
+    await editor.focusFieldTarget({
+      kind: 'form_text',
+      section: otherField.location.sectionIndex,
+      paragraph: otherField.location.paraIndex,
+      fieldId: otherField.fieldId,
+    });
+    await new Promise(resolveFrame => requestAnimationFrame(() => resolveFrame()));
+    const documentEvents = [];
+    const selectionEvents = [];
+    const offDocument = editor.onDocumentChanged(event => documentEvents.push(event.reason));
+    const offSelection = editor.onFieldSelectionChanged(event => selectionEvents.push(event.target));
+    const focus = await editor.focusFieldTarget(target);
+    await new Promise(resolveFrame => requestAnimationFrame(() => resolveFrame()));
+    const focusedSelection = await editor.getFieldSelectionContext();
+    const commandId = crypto.randomUUID();
+    const startedAt = performance.now();
+    const applied = await editor.applyFieldCommand({
+      schemaVersion: 1,
+      commandId,
+      expectedDocumentEpoch: initialState.documentEpoch,
+      expectedChangeSeq: initialState.changeSeq,
+      expectedDocumentSha256: initialState.documentSha256,
+      target,
+      expectedBeforeSha256: before.textSha256,
+      expectedFormatSha256: before.formatSha256,
+      expectedAdjacentContextSha256: before.adjacentContextSha256,
+      replacement: '주식회사 노튼',
+    });
+    const applyElapsedMs = performance.now() - startedAt;
+    const after = collectFieldTargetEvidence(wasm, target);
+    const afterState = await editor.getDocumentState();
+    const appliedBytes = await editor.exportHwp();
+
+    const reopenHost = document.createElement('div');
+    reopenHost.style.cssText = 'position: fixed; width: 1px; height: 1px; overflow: hidden';
+    document.body.append(reopenHost);
+    const reopened = await createEditor(reopenHost, {
+      studioUrl: `${location.origin}/`,
+      renderer: 'canvas2d',
+      handshakeTimeoutMs: 10_000,
+    });
+    await reopened.loadFile(appliedBytes, 'field-01-applied.hwp', { suppressDialogs: true });
+    const reopenedWasm = reopened.element.contentWindow.__wasm;
+    if (!reopenedWasm) throw new Error('reopened Studio WasmBridge is unavailable');
+    const reopenedValue = reopenedWasm.getFieldValue(field.fieldId).value;
+    const reopenedPageCount = (await reopened.getDocumentState()).pageCount;
+    reopened.destroy();
+    reopenHost.remove();
+
+    const reverted = await editor.revertFieldCommand({
+      schemaVersion: 1,
+      commandId,
+      expectedDocumentEpoch: applied.documentEpoch,
+      expectedChangeSeq: applied.afterChangeSeq,
+      expectedAfterDocumentSha256: applied.afterDocumentSha256,
+      expectedAfterSha256: applied.afterTextSha256,
+    });
+    const restored = collectFieldTargetEvidence(wasm, target);
+    const finalState = await editor.getDocumentState();
+    await new Promise(resolveFrame => requestAnimationFrame(resolveFrame));
+    const output = {
+      target,
+      original: before.text,
+      focus,
+      focusedSelection,
+      applyElapsedMs,
+      appliedText: after.text,
+      formatStable: after.formatSha256 === before.formatSha256,
+      contextStable: after.adjacentContextSha256 === before.adjacentContextSha256,
+      reopenedValue,
+      reopenedPageCount,
+      restoredText: restored.text,
+      restoredFormatStable: restored.formatSha256 === before.formatSha256,
+      restoredContextStable: restored.adjacentContextSha256 === before.adjacentContextSha256,
+      pageCounts: [initialState.pageCount, afterState.pageCount, finalState.pageCount],
+      changeSeqs: [initialState.changeSeq, applied.afterChangeSeq, reverted.afterChangeSeq],
+      documentEvents,
+      selectionEventMatched: selectionEvents.some(selection =>
+        selection?.kind === 'form_text' && selection.fieldId === target.fieldId),
+      modalCount: editor.element.contentDocument.querySelectorAll('.modal-overlay').length,
+    };
+    offDocument();
+    offSelection();
+    editor.destroy();
+    return output;
+  }, { editorModuleUrl: EDITOR_MODULE_URL });
+
+  assert(result.original === '', '빈 누름틀 preimage를 exact 값으로 읽음');
+  assert(result.applyElapsedMs <= 3000, 'form_text apply와 strict render 3초 이내');
+  assert(result.focus.focused, 'exact form_text focus 성공');
+  assert(result.focusedSelection.editable, 'focus 직후 form_text를 editable field로 인식');
+  assert(result.focusedSelection.target?.fieldId === result.target.fieldId,
+    'focus 직후 form_text selection target 동기화');
+  assert(result.appliedText === '주식회사 노튼', 'form_text replacement 즉시 반영');
+  assert(result.formatStable && result.contextStable, '누름틀 서식과 비대상 문맥 보존');
+  assert(result.reopenedValue === '주식회사 노튼', '적용본 HWP 재개방 누름틀 값 유지');
+  assert(result.reopenedPageCount === result.pageCounts[0], '적용본 HWP 재개방 page count 유지');
+  assert(result.restoredText === result.original, 'form_text revert로 원문 복원');
+  assert(result.restoredFormatStable && result.restoredContextStable,
+    'form_text revert 뒤 서식과 비대상 문맥 복원');
+  assert(result.pageCounts.every(count => count === result.pageCounts[0]),
+    'form_text apply/revert page count 보존');
+  assert(result.changeSeqs[1] === result.changeSeqs[0] + 1
+    && result.changeSeqs[2] === result.changeSeqs[0] + 2,
+  'form_text apply/revert changeSeq 정확히 1씩 증가');
+  assert(JSON.stringify(result.documentEvents) === JSON.stringify([
+    'field_agent_apply', 'field_agent_revert',
+  ]), 'form_text public document event 순서');
+  assert(result.selectionEventMatched, 'field selection event에 exact form_text target 전달');
+  assert(result.modalCount === 0, 'form_text focus/apply/revert 중 경고 modal 0회');
 }, { skipLoadApp: true });

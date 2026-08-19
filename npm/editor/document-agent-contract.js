@@ -80,6 +80,25 @@ export function validateTableCellTextTarget(value, code = 'INVALID_COMMAND') {
   return target;
 }
 
+export function validateFormTextTarget(value, code = 'INVALID_COMMAND') {
+  const target = record(value, 'target', code);
+  exactKeys(target, ['kind', 'section', 'paragraph', 'fieldId'], 'target', code);
+  if (target.kind !== 'form_text') {
+    throw contractError(code, 'target.kind must be form_text');
+  }
+  for (const key of ['section', 'paragraph', 'fieldId']) {
+    safeInteger(target[key], `target.${key}`, 0, code);
+  }
+  return target;
+}
+
+export function validateFieldTarget(value, code = 'INVALID_COMMAND') {
+  const target = record(value, 'target', code);
+  if (target.kind === 'table_cell_text') return validateTableCellTextTarget(target, code);
+  if (target.kind === 'form_text') return validateFormTextTarget(target, code);
+  throw contractError(code, 'target.kind must be table_cell_text or form_text');
+}
+
 export function validateApplyTextCommand(value) {
   const code = 'INVALID_COMMAND';
   const command = record(value, 'command', code);
@@ -111,7 +130,7 @@ export function validateApplyTextCommand(value) {
 }
 
 export function validateApplyFieldCommand(value) {
-  const command = validateApplyTextCommandShape(value, validateTableCellTextTarget);
+  const command = validateApplyTextCommandShape(value, validateFieldTarget);
   if (/\r|\n/u.test(command.replacement)) {
     throw contractError('INVALID_COMMAND', 'field command replacement must not contain line breaks');
   }
@@ -223,7 +242,7 @@ export function validateFieldSelectionContext(value) {
   safeInteger(selection.changeSeq, 'field selection context changeSeq', 0, code);
   safeInteger(selection.page, 'field selection context page', 1, code);
   boolean(selection.editable, 'field selection context editable', code);
-  if (selection.target !== null) validateTableCellTextTarget(selection.target, code);
+  if (selection.target !== null) validateFieldTarget(selection.target, code);
   if (selection.target === null && selection.editable) {
     throw contractError(code, 'field selection context without target cannot be editable');
   }
@@ -264,7 +283,7 @@ export function validateTextCommandReceipt(value) {
 }
 
 export function validateFieldCommandReceipt(value) {
-  return validateCommandReceiptShape(value, validateTableCellTextTarget, 'field command receipt');
+  return validateCommandReceiptShape(value, validateFieldTarget, 'field command receipt');
 }
 
 function validateCommandReceiptShape(value, validateTarget, label) {

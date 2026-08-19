@@ -3,6 +3,8 @@ import {
   type RhwpApplyFieldCommandV1,
   type RhwpApplyTextCommandV1,
   type RhwpBodyParagraphTargetV1,
+  type RhwpFieldTargetV1,
+  type RhwpFormTextTargetV1,
   type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
   type RhwpTableCellTextTargetV1,
@@ -80,6 +82,28 @@ export function parseTableCellTextTarget(value: unknown): RhwpTableCellTextTarge
   return target as unknown as RhwpTableCellTextTargetV1;
 }
 
+export function parseFormTextTarget(value: unknown): RhwpFormTextTargetV1 {
+  const target = record(value, 'target');
+  exactKeys(target, ['kind', 'section', 'paragraph', 'fieldId'], 'target');
+  if (target.kind !== 'form_text') {
+    throw new DocumentAgentError('INVALID_COMMAND', 'target.kind는 form_text여야 합니다.');
+  }
+  safeInteger(target.section, 0, 'target.section');
+  safeInteger(target.paragraph, 0, 'target.paragraph');
+  safeInteger(target.fieldId, 0, 'target.fieldId');
+  return target as unknown as RhwpFormTextTargetV1;
+}
+
+export function parseFieldTarget(value: unknown): RhwpFieldTargetV1 {
+  const target = record(value, 'target');
+  if (target.kind === 'table_cell_text') return parseTableCellTextTarget(target);
+  if (target.kind === 'form_text') return parseFormTextTarget(target);
+  throw new DocumentAgentError(
+    'INVALID_COMMAND',
+    'target.kind는 table_cell_text 또는 form_text여야 합니다.',
+  );
+}
+
 export function parseApplyTextCommand(value: unknown): RhwpApplyTextCommandV1 {
   const command = record(value, 'command');
   exactKeys(command, [
@@ -122,7 +146,7 @@ export function parseApplyFieldCommand(value: unknown): RhwpApplyFieldCommandV1 
   safeInteger(command.expectedDocumentEpoch, 1, 'expectedDocumentEpoch');
   safeInteger(command.expectedChangeSeq, 0, 'expectedChangeSeq');
   digest(command.expectedDocumentSha256, 'expectedDocumentSha256');
-  const target = parseTableCellTextTarget(command.target);
+  const target = parseFieldTarget(command.target);
   digest(command.expectedBeforeSha256, 'expectedBeforeSha256');
   digest(command.expectedFormatSha256, 'expectedFormatSha256');
   digest(command.expectedAdjacentContextSha256, 'expectedAdjacentContextSha256');

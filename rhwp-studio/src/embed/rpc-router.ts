@@ -6,9 +6,9 @@ import {
   parseApplyFieldCommand,
   parseApplyTextCommand,
   parseBodyParagraphTarget,
+  parseFieldTarget,
   parseRevertFieldCommand,
   parseRevertTextCommand,
-  parseTableCellTextTarget,
 } from '../document-agent/contract.ts';
 import type {
   RhwpApplyFieldCommandV1,
@@ -17,10 +17,10 @@ import type {
   RhwpDocumentStateV1,
   RhwpFieldCommandReceiptV1,
   RhwpFieldSelectionContextV1,
+  RhwpFieldTargetV1,
   RhwpRevertFieldCommandV1,
   RhwpRevertTextCommandV1,
   RhwpSelectionContextV1,
-  RhwpTableCellTextTargetV1,
   RhwpTextCommandReceiptV1,
 } from '../document-agent/types.ts';
 import type {
@@ -60,7 +60,7 @@ export interface EmbedRpcHandlers {
   applyTextCommand(command: RhwpApplyTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   revertTextCommand(command: RhwpRevertTextCommandV1): Promise<RhwpTextCommandReceiptV1>;
   focusTarget(target: RhwpBodyParagraphTargetV1): Promise<{ focused: boolean; page: number }>;
-  focusFieldTarget(target: RhwpTableCellTextTargetV1): Promise<{ focused: boolean; page: number }>;
+  focusFieldTarget(target: RhwpFieldTargetV1): Promise<{ focused: boolean; page: number }>;
   applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
   revertFieldCommand(command: RhwpRevertFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
 
@@ -200,7 +200,7 @@ export async function routeEmbedRequest(
     case 'focusTarget': return handlers.focusTarget(parseBodyParagraphTarget(
       assertOnlyParam(params, 'target', 'focusTarget params'),
     ));
-    case 'focusFieldTarget': return handlers.focusFieldTarget(parseTableCellTextTarget(
+    case 'focusFieldTarget': return handlers.focusFieldTarget(parseFieldTarget(
       assertOnlyParam(params, 'target', 'focusFieldTarget params'),
     ));
     case 'applyFieldCommand': return handlers.applyFieldCommand(parseApplyFieldCommand(

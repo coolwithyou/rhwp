@@ -16,6 +16,16 @@ export interface RhwpTableCellTextTargetV1 {
   cellParagraph: number;
 }
 
+/** 서버가 current revision에서 확정한 본문 누름틀 입력 위치. */
+export interface RhwpFormTextTargetV1 {
+  kind: 'form_text';
+  section: number;
+  paragraph: number;
+  fieldId: number;
+}
+
+export type RhwpFieldTargetV1 = RhwpTableCellTextTargetV1 | RhwpFormTextTargetV1;
+
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
   format: 'hwp' | 'hwpx';
@@ -44,7 +54,7 @@ export interface RhwpFieldSelectionContextV1 {
   changeSeq: number;
   page: number;
   editable: boolean;
-  target: RhwpTableCellTextTargetV1 | null;
+  target: RhwpFieldTargetV1 | null;
 }
 
 export interface RhwpApplyTextCommandV1 {
@@ -76,7 +86,7 @@ export interface RhwpApplyFieldCommandV1 {
   expectedDocumentEpoch: number;
   expectedChangeSeq: number;
   expectedDocumentSha256: string;
-  target: RhwpTableCellTextTargetV1;
+  target: RhwpFieldTargetV1;
   expectedBeforeSha256: string;
   expectedFormatSha256: string;
   expectedAdjacentContextSha256: string;
@@ -126,7 +136,7 @@ export interface RhwpFieldCommandReceiptV1 {
   adjacentContextSha256: string;
   pageCountBefore: number;
   pageCountAfter: number;
-  target: RhwpTableCellTextTargetV1;
+  target: RhwpFieldTargetV1;
 }
 
 export const DOCUMENT_AGENT_ERROR_CODES = [

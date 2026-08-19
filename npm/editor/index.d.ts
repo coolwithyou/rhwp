@@ -217,6 +217,15 @@ export interface RhwpTableCellTextTargetV1 {
   cellParagraph: number;
 }
 
+export interface RhwpFormTextTargetV1 {
+  kind: 'form_text';
+  section: number;
+  paragraph: number;
+  fieldId: number;
+}
+
+export type RhwpFieldTargetV1 = RhwpTableCellTextTargetV1 | RhwpFormTextTargetV1;
+
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
   format: 'hwp' | 'hwpx';
@@ -246,7 +255,7 @@ export interface RhwpFieldSelectionContextV1 {
   /** 1부터 시작하는 UI 페이지 번호 */
   page: number;
   editable: boolean;
-  target: RhwpTableCellTextTargetV1 | null;
+  target: RhwpFieldTargetV1 | null;
 }
 
 export interface RhwpApplyTextCommandV1 {
@@ -277,7 +286,7 @@ export interface RhwpApplyFieldCommandV1 {
   expectedDocumentEpoch: number;
   expectedChangeSeq: number;
   expectedDocumentSha256: string;
-  target: RhwpTableCellTextTargetV1;
+  target: RhwpFieldTargetV1;
   expectedBeforeSha256: string;
   expectedFormatSha256: string;
   expectedAdjacentContextSha256: string;
@@ -319,7 +328,7 @@ export interface RhwpFieldCommandReceiptV1 {
   adjacentContextSha256: string;
   pageCountBefore: number;
   pageCountAfter: number;
-  target: RhwpTableCellTextTargetV1;
+  target: RhwpFieldTargetV1;
 }
 
 export interface RhwpDocumentChangedEventV1 {
@@ -378,7 +387,7 @@ export declare class RhwpEditor {
   /** exact body paragraph target으로 캐럿과 뷰포트 이동 */
   focusTarget(target: RhwpBodyParagraphTargetV1): Promise<{ focused: boolean; page: number }>;
   /** exact table cell text target으로 캐럿과 뷰포트 이동 */
-  focusFieldTarget(target: RhwpTableCellTextTargetV1): Promise<{ focused: boolean; page: number }>;
+  focusFieldTarget(target: RhwpFieldTargetV1): Promise<{ focused: boolean; page: number }>;
   /** exact table cell field를 한 트랜잭션으로 교체 */
   applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
   /** 가장 최근 exact field command를 한 트랜잭션으로 되돌림 */

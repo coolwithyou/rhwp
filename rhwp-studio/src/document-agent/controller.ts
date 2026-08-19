@@ -12,6 +12,8 @@ import {
   type RhwpDocumentStateV1,
   type RhwpFieldCommandReceiptV1,
   type RhwpFieldSelectionContextV1,
+  type RhwpFieldTargetV1,
+  type RhwpFormTextTargetV1,
   type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
   type RhwpSelectionContextV1,
@@ -41,6 +43,12 @@ export interface DocumentAgentWasm {
   getParaPropertiesAt(section: number, paragraph: number): { paraShapeId?: number };
   getStyleAt(section: number, paragraph: number): { id: number; name: string };
   getFieldInfoAt(position: DocumentPosition): FieldInfoResult;
+  getFieldList(): RhwpFormFieldEntry[];
+  getFieldValue(fieldId: number): { ok: boolean; value: string };
+  setFieldValue(
+    fieldId: number,
+    value: string,
+  ): { ok: boolean; fieldId: number; oldValue: string; newValue: string };
   getTextInCell(
     section: number,
     parentPara: number,
@@ -182,6 +190,21 @@ export interface DocumentAgentInput {
     cellIndex: number,
     cellParagraph: number,
   ): { focused: boolean; page: number };
+  focusFormText(section: number, paragraph: number, fieldId: number): { focused: boolean; page: number };
+}
+
+export interface RhwpFormFieldEntry {
+  fieldId: number;
+  fieldType: string;
+  cellField: boolean;
+  name: string;
+  guide: string;
+  command: string;
+  value: string;
+  location: { sectionIndex: number; paraIndex: number; path?: Array<unknown> };
+  startCharIdx?: number;
+  endCharIdx?: number;
+  editableInForm?: boolean;
 }
 
 export interface TargetEvidence {
@@ -347,6 +370,108 @@ function restoreFieldCharShapes(
   }
 }
 
+function restoreFormTextCharShapes(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+  fieldStart: number,
+  replacementLength: number,
+  evidence: TargetEvidence,
+): void {
+  if (replacementLength === 0) return;
+  if (evidence.charShapeIds.length !== replacementLength) {
+    if (!evidence.charShapeIds.every(id => id === evidence.charShapeId)) {
+      throw new DocumentAgentError(
+        'TARGET_FORMAT_MISMATCH',
+        '혼합 글자 서식 누름틀은 같은 길이의 exact 치환만 지원합니다.',
+      );
+    }
+    wasm.setCharShapeId(
+      target.section,
+      target.paragraph,
+      fieldStart,
+      fieldStart + replacementLength,
+      evidence.charShapeId,
+    );
+    return;
+  }
+  let runStart = 0;
+  while (runStart < replacementLength) {
+    const id = evidence.charShapeIds[runStart]!;
+    let runEnd = runStart + 1;
+    while (runEnd < replacementLength && evidence.charShapeIds[runEnd] === id) runEnd += 1;
+    wasm.setCharShapeId(
+      target.section,
+      target.paragraph,
+      fieldStart + runStart,
+      fieldStart + runEnd,
+      id,
+    );
+    runStart = runEnd;
+  }
+}
+
+function replaceExactFieldText(
+  wasm: DocumentAgentWasm,
+  target: RhwpFieldTargetV1,
+  beforeText: string,
+  replacement: string,
+  evidence: TargetEvidence,
+): DocumentPosition {
+  const replacementLength = codePointLength(replacement);
+  if (target.kind === 'form_text') {
+    const result = wasm.setFieldValue(target.fieldId, replacement);
+    if (!result.ok
+        || result.fieldId !== target.fieldId
+        || result.oldValue !== beforeText
+        || result.newValue !== replacement) {
+      throw new DocumentAgentError('TRANSACTION_FAILED', '누름틀 field value를 교체하지 못했습니다.');
+    }
+    const field = exactFormField(wasm, target);
+    restoreFormTextCharShapes(wasm, target, field.startCharIdx, replacementLength, evidence);
+    wasm.setParaShapeId(target.section, target.paragraph, evidence.paraShapeId);
+    return {
+      sectionIndex: target.section,
+      paragraphIndex: target.paragraph,
+      charOffset: field.endCharIdx,
+    };
+  }
+
+  let deferred = false;
+  try {
+    wasm.beginDeferredPagination?.();
+    deferred = true;
+    const result = replaceWholeFieldTextDeferred(wasm, target, beforeText, replacement);
+    if (!result.ok || result.charOffset !== replacementLength) {
+      throw new DocumentAgentError('TRANSACTION_FAILED', 'field target 셀 텍스트를 교체하지 못했습니다.');
+    }
+    restoreFieldCharShapes(wasm, target, replacementLength, evidence);
+    wasm.setCellParaShapeId(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      target.cellParagraph,
+      evidence.paraShapeId,
+    );
+    wasm.flushDeferredPagination?.();
+    deferred = false;
+    return {
+      sectionIndex: target.section,
+      paragraphIndex: target.cellParagraph,
+      charOffset: replacementLength,
+      parentParaIndex: target.parentPara,
+      controlIndex: target.controlIndex,
+      cellIndex: target.cellIndex,
+      cellParaIndex: target.cellParagraph,
+    };
+  } catch (error) {
+    if (deferred) {
+      try { wasm.cancelDeferredPagination?.(); } catch { /* snapshot rollback이 최종 복구한다. */ }
+    }
+    throw error;
+  }
+}
+
 function safeId(value: number | undefined, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', `${label}을 확인할 수 없습니다.`);
@@ -487,7 +612,7 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-function assertFieldTargetCoordinates(
+function assertTableCellTargetCoordinates(
   wasm: DocumentAgentWasm,
   target: RhwpTableCellTextTargetV1,
 ): number {
@@ -521,6 +646,144 @@ function assertFieldTargetCoordinates(
   } catch {
     throw new DocumentAgentError('TARGET_NOT_FOUND', 'exact table cell text target을 찾을 수 없습니다.');
   }
+}
+
+function exactFormField(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+): RhwpFormFieldEntry & { startCharIdx: number; endCharIdx: number } {
+  let matches: RhwpFormFieldEntry[];
+  try {
+    matches = wasm.getFieldList().filter(field => field.fieldId === target.fieldId);
+  } catch {
+    throw new DocumentAgentError('TARGET_NOT_FOUND', '누름틀 필드 목록을 읽을 수 없습니다.');
+  }
+  if (matches.length !== 1) {
+    throw new DocumentAgentError('TARGET_NOT_FOUND', 'exact 누름틀 fieldId를 찾을 수 없습니다.');
+  }
+  const field = matches[0]!;
+  const path = field.location?.path;
+  if (field.fieldType !== 'clickhere'
+      || field.cellField === true
+      || field.editableInForm !== true
+      || field.location?.sectionIndex !== target.section
+      || field.location?.paraIndex !== target.paragraph
+      || (Array.isArray(path) && path.length > 0)
+      || !Number.isSafeInteger(field.startCharIdx)
+      || !Number.isSafeInteger(field.endCharIdx)
+      || (field.startCharIdx as number) < 0
+      || (field.endCharIdx as number) < (field.startCharIdx as number)) {
+    throw new DocumentAgentError(
+      'TARGET_NOT_FOUND',
+      '본문의 편집 가능한 exact 누름틀 field target이 아닙니다.',
+    );
+  }
+  const length = wasm.getParagraphLength(target.section, target.paragraph);
+  if ((field.endCharIdx as number) > length || length > MAX_PARAGRAPH_LENGTH) {
+    throw new DocumentAgentError('TARGET_NOT_FOUND', '누름틀 범위가 current paragraph와 다릅니다.');
+  }
+  const value = wasm.getFieldValue(target.fieldId);
+  if (!value.ok || codePointLength(value.value) !== (field.endCharIdx as number) - (field.startCharIdx as number)) {
+    throw new DocumentAgentError('TARGET_PREIMAGE_MISMATCH', '누름틀 값과 current field 범위가 다릅니다.');
+  }
+  return field as RhwpFormFieldEntry & { startCharIdx: number; endCharIdx: number };
+}
+
+function formFieldCharShapeRuns(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+  field: RhwpFormFieldEntry & { startCharIdx: number; endCharIdx: number },
+): number[] {
+  const ids: number[] = [];
+  const end = Math.max(field.endCharIdx, field.startCharIdx + 1);
+  for (let offset = field.startCharIdx; offset < end; offset += 1) {
+    ids.push(safeId(
+      wasm.getCharPropertiesAt(target.section, target.paragraph, offset).charShapeId,
+      'form charShapeId',
+    ));
+  }
+  return ids;
+}
+
+function paragraphTextSlice(
+  wasm: DocumentAgentWasm,
+  section: number,
+  paragraph: number,
+  start: number,
+  end: number,
+): string {
+  return end > start ? wasm.getTextRange(section, paragraph, start, end - start) : '';
+}
+
+function charShapeSlice(
+  wasm: DocumentAgentWasm,
+  section: number,
+  paragraph: number,
+  start: number,
+  end: number,
+): number[] {
+  const ids: number[] = [];
+  for (let offset = start; offset < end; offset += 1) {
+    ids.push(safeId(
+      wasm.getCharPropertiesAt(section, paragraph, offset).charShapeId,
+      'form context charShapeId',
+    ));
+  }
+  return ids;
+}
+
+function formNonTargetManifestSha256(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+  field: RhwpFormFieldEntry & { startCharIdx: number; endCharIdx: number },
+): string {
+  const paragraphs: Array<Record<string, unknown>> = [];
+  for (let section = 0; section < wasm.getSectionCount(); section += 1) {
+    for (let paragraph = 0; paragraph < wasm.getParagraphCount(section); paragraph += 1) {
+      if (section !== target.section || paragraph !== target.paragraph) {
+        paragraphs.push(paragraphSemantic(wasm, section, paragraph));
+        continue;
+      }
+      const length = wasm.getParagraphLength(section, paragraph);
+      paragraphs.push({
+        section,
+        paragraph,
+        prefixTextSha256: digestText(paragraphTextSlice(wasm, section, paragraph, 0, field.startCharIdx)),
+        suffixTextSha256: digestText(paragraphTextSlice(wasm, section, paragraph, field.endCharIdx, length)),
+        prefixCharShapeIds: charShapeSlice(wasm, section, paragraph, 0, field.startCharIdx),
+        suffixCharShapeIds: charShapeSlice(wasm, section, paragraph, field.endCharIdx, length),
+        paraShapeId: safeId(wasm.getParaPropertiesAt(section, paragraph).paraShapeId, 'form paraShapeId'),
+        styleId: safeId(wasm.getStyleAt(section, paragraph).id, 'form styleId'),
+      });
+    }
+  }
+  const otherFields = wasm.getFieldList()
+    .filter(entry => entry.fieldId !== target.fieldId)
+    .filter(entry => entry.location?.sectionIndex !== target.section
+      || entry.location?.paraIndex !== target.paragraph)
+    .map(entry => ({
+      fieldId: entry.fieldId,
+      fieldType: entry.fieldType,
+      cellField: entry.cellField,
+      name: entry.name,
+      guide: entry.guide,
+      command: entry.command,
+      value: entry.value,
+      location: entry.location,
+      startCharIdx: entry.startCharIdx,
+      endCharIdx: entry.endCharIdx,
+      editableInForm: entry.editableInForm,
+    }));
+  return digestText(stableJson({
+    schemaVersion: 1,
+    sectionCount: wasm.getSectionCount(),
+    paragraphCounts: Array.from(
+      { length: wasm.getSectionCount() },
+      (_, section) => wasm.getParagraphCount(section),
+    ),
+    paragraphs,
+    otherFields,
+  }));
 }
 
 function cellCharShapeRuns(
@@ -628,11 +891,11 @@ function fieldNonTargetManifestSha256(
 }
 
 /** 서버와 SDK가 같은 exact cell preimage를 결속할 수 있도록 공개하는 field evidence. */
-export function collectFieldTargetEvidence(
+function collectTableCellTargetEvidence(
   wasm: DocumentAgentWasm,
   target: RhwpTableCellTextTargetV1,
 ): TargetEvidence {
-  const length = assertFieldTargetCoordinates(wasm, target);
+  const length = assertTableCellTargetCoordinates(wasm, target);
   const charShapeIds = cellCharShapeRuns(wasm, target, length);
   const charShapeId = charShapeIds[0];
   const charShape = charShapeIds.every(id => id === charShapeId)
@@ -675,6 +938,61 @@ export function collectFieldTargetEvidence(
     paraShapeId,
     styleId: 0,
   };
+}
+
+function collectFormTextTargetEvidence(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+): TargetEvidence {
+  const field = exactFormField(wasm, target);
+  const value = wasm.getFieldValue(target.fieldId);
+  if (!value.ok) {
+    throw new DocumentAgentError('TARGET_NOT_FOUND', 'exact 누름틀 값을 읽을 수 없습니다.');
+  }
+  const charShapeIds = formFieldCharShapeRuns(wasm, target, field);
+  const charShapeId = charShapeIds[0]!;
+  const charShape = charShapeIds.every(id => id === charShapeId)
+    ? { kind: 'uniform', id: charShapeId }
+    : { kind: 'runs', ids: charShapeIds };
+  const paraShapeId = safeId(
+    wasm.getParaPropertiesAt(target.section, target.paragraph).paraShapeId,
+    'form paraShapeId',
+  );
+  const styleId = safeId(wasm.getStyleAt(target.section, target.paragraph).id, 'form styleId');
+  return {
+    text: value.value,
+    textSha256: digestText(value.value),
+    formatSha256: digestText(stableJson({
+      schemaVersion: 1,
+      kind: 'form_text',
+      charShape,
+      paraShapeId,
+      styleId,
+      field: {
+        fieldId: field.fieldId,
+        fieldType: field.fieldType,
+        name: field.name,
+        guide: field.guide,
+        command: field.command,
+        editableInForm: field.editableInForm,
+      },
+    })),
+    adjacentContextSha256: formNonTargetManifestSha256(wasm, target, field),
+    charShapeId,
+    charShapeIds,
+    paraShapeId,
+    styleId,
+  };
+}
+
+/** 서버와 SDK가 같은 exact field preimage를 결속할 수 있도록 공개하는 field evidence. */
+export function collectFieldTargetEvidence(
+  wasm: DocumentAgentWasm,
+  target: RhwpFieldTargetV1,
+): TargetEvidence {
+  return target.kind === 'form_text'
+    ? collectFormTextTargetEvidence(wasm, target)
+    : collectTableCellTargetEvidence(wasm, target);
 }
 
 function nonTargetManifestSha256(
@@ -867,7 +1185,7 @@ export class DocumentAgentController {
       position.sectionIndex,
       parentPara ?? position.paragraphIndex,
     );
-    let target: RhwpTableCellTextTargetV1 | null = null;
+    let target: RhwpFieldTargetV1 | null = null;
     let editable = false;
 
     if ([position.sectionIndex, parentPara, controlIndex, cellIndex, cellParagraph]
@@ -885,6 +1203,29 @@ export class DocumentAgentController {
         this.currentFormat();
         editable = true;
       } catch {
+        editable = false;
+      }
+    }
+
+    if (!target && parentPara === undefined && controlIndex === undefined) {
+      try {
+        const field = this.deps.wasm.getFieldInfoAt(position);
+        if (field.inField
+            && field.fieldType === 'clickhere'
+            && Number.isSafeInteger(field.fieldId)
+            && (field.fieldId as number) >= 0) {
+          target = {
+            kind: 'form_text',
+            section: position.sectionIndex,
+            paragraph: position.paragraphIndex,
+            fieldId: field.fieldId as number,
+          };
+          collectFieldTargetEvidence(this.deps.wasm, target);
+          this.currentFormat();
+          editable = true;
+        }
+      } catch {
+        target = null;
         editable = false;
       }
     }
@@ -1292,62 +1633,29 @@ export class DocumentAgentController {
         operationType: 'field-agent:apply',
         operation: (wasm) => {
           this.assertRuntimeFence(command.expectedDocumentEpoch, beforeSeq);
-          let deferred = false;
-          try {
-            wasm.beginDeferredPagination?.();
-            deferred = true;
-            const result = replaceWholeFieldTextDeferred(
-              wasm,
-              command.target,
-              beforeEvidence.text,
-              command.replacement,
-            );
-            if (!result.ok || result.charOffset !== codePointLength(command.replacement)) {
-              throw new DocumentAgentError('TRANSACTION_FAILED', 'field target 셀 텍스트를 교체하지 못했습니다.');
-            }
-            const afterLength = replacementLength;
-            restoreFieldCharShapes(wasm, command.target, afterLength, beforeEvidence);
-            wasm.setCellParaShapeId(
-              command.target.section,
-              command.target.parentPara,
-              command.target.controlIndex,
-              command.target.cellIndex,
-              command.target.cellParagraph,
-              beforeEvidence.paraShapeId,
-            );
-            wasm.flushDeferredPagination?.();
-            deferred = false;
-
-            afterEvidence = collectFieldTargetEvidence(wasm, command.target);
-            if (afterEvidence.text !== command.replacement) {
-              throw new DocumentAgentError('TARGET_PREIMAGE_MISMATCH', 'field target postimage가 replacement와 다릅니다.');
-            }
-            if (afterEvidence.formatSha256 !== beforeEvidence.formatSha256) {
-              throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', 'field target format이 변경되었습니다.');
-            }
-            if (afterEvidence.adjacentContextSha256 !== beforeNonTarget) {
-              throw new DocumentAgentError('NON_TARGET_CHANGED', 'field target 밖 표 내용이 변경되었습니다.');
-            }
-            if (wasm.pageCount !== state.pageCount) {
-              throw new DocumentAgentError('PAGE_COUNT_CHANGED', 'field apply 뒤 페이지 수가 변경되었습니다.');
-            }
-            afterDocumentSha256 = exportDocumentSha256(wasm, state.format);
-            this.assertWithinBudget(startedAt);
-            return {
-              sectionIndex: command.target.section,
-              paragraphIndex: command.target.cellParagraph,
-              charOffset: afterLength,
-              parentParaIndex: command.target.parentPara,
-              controlIndex: command.target.controlIndex,
-              cellIndex: command.target.cellIndex,
-              cellParaIndex: command.target.cellParagraph,
-            };
-          } catch (error) {
-            if (deferred) {
-              try { wasm.cancelDeferredPagination?.(); } catch { /* snapshot rollback이 최종 복구한다. */ }
-            }
-            throw error;
+          const position = replaceExactFieldText(
+            wasm,
+            command.target,
+            beforeEvidence.text,
+            command.replacement,
+            beforeEvidence,
+          );
+          afterEvidence = collectFieldTargetEvidence(wasm, command.target);
+          if (afterEvidence.text !== command.replacement) {
+            throw new DocumentAgentError('TARGET_PREIMAGE_MISMATCH', 'field target postimage가 replacement와 다릅니다.');
           }
+          if (afterEvidence.formatSha256 !== beforeEvidence.formatSha256) {
+            throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', 'field target format이 변경되었습니다.');
+          }
+          if (afterEvidence.adjacentContextSha256 !== beforeNonTarget) {
+            throw new DocumentAgentError('NON_TARGET_CHANGED', 'field target 밖 문서 내용이 변경되었습니다.');
+          }
+          if (wasm.pageCount !== state.pageCount) {
+            throw new DocumentAgentError('PAGE_COUNT_CHANGED', 'field apply 뒤 페이지 수가 변경되었습니다.');
+          }
+          afterDocumentSha256 = exportDocumentSha256(wasm, state.format);
+          this.assertWithinBudget(startedAt);
+          return position;
         },
         meta: {
           actionId: 'field-agent:apply',
@@ -1454,57 +1762,25 @@ export class DocumentAgentController {
         operationType: 'field-agent:revert',
         operation: (wasm) => {
           this.assertRuntimeFence(command.expectedDocumentEpoch, beforeSeq);
-          let deferred = false;
-          try {
-            wasm.beginDeferredPagination?.();
-            deferred = true;
-            const result = replaceWholeFieldTextDeferred(
-              wasm,
-              entry.command.target,
-              currentEvidence.text,
-              entry.beforeText,
-            );
-            if (!result.ok || result.charOffset !== codePointLength(entry.beforeText)) {
-              throw new DocumentAgentError('TRANSACTION_FAILED', 'field inverse replace가 실패했습니다.');
-            }
-            const beforeLength = codePointLength(entry.beforeText);
-            restoreFieldCharShapes(wasm, entry.command.target, beforeLength, entry.beforeEvidence);
-            wasm.setCellParaShapeId(
-              entry.command.target.section,
-              entry.command.target.parentPara,
-              entry.command.target.controlIndex,
-              entry.command.target.cellIndex,
-              entry.command.target.cellParagraph,
-              entry.beforeEvidence.paraShapeId,
-            );
-            wasm.flushDeferredPagination?.();
-            deferred = false;
-            revertedEvidence = collectFieldTargetEvidence(wasm, entry.command.target);
-            if (revertedEvidence.textSha256 !== entry.beforeEvidence.textSha256
-                || revertedEvidence.formatSha256 !== entry.beforeEvidence.formatSha256
-                || revertedEvidence.adjacentContextSha256 !== entry.nonTargetManifestSha256) {
-              throw new DocumentAgentError('TRANSACTION_FAILED', 'field before 상태 복원이 일치하지 않습니다.');
-            }
-            if (wasm.pageCount !== entry.applyReceipt.pageCountBefore) {
-              throw new DocumentAgentError('PAGE_COUNT_CHANGED', 'field revert 뒤 페이지 수가 다릅니다.');
-            }
-            afterDocumentSha256 = exportDocumentSha256(wasm, state.format);
-            this.assertWithinBudget(startedAt);
-            return {
-              sectionIndex: entry.command.target.section,
-              paragraphIndex: entry.command.target.cellParagraph,
-              charOffset: beforeLength,
-              parentParaIndex: entry.command.target.parentPara,
-              controlIndex: entry.command.target.controlIndex,
-              cellIndex: entry.command.target.cellIndex,
-              cellParaIndex: entry.command.target.cellParagraph,
-            };
-          } catch (error) {
-            if (deferred) {
-              try { wasm.cancelDeferredPagination?.(); } catch { /* snapshot rollback이 최종 복구한다. */ }
-            }
-            throw error;
+          const position = replaceExactFieldText(
+            wasm,
+            entry.command.target,
+            currentEvidence.text,
+            entry.beforeText,
+            entry.beforeEvidence,
+          );
+          revertedEvidence = collectFieldTargetEvidence(wasm, entry.command.target);
+          if (revertedEvidence.textSha256 !== entry.beforeEvidence.textSha256
+              || revertedEvidence.formatSha256 !== entry.beforeEvidence.formatSha256
+              || revertedEvidence.adjacentContextSha256 !== entry.nonTargetManifestSha256) {
+            throw new DocumentAgentError('TRANSACTION_FAILED', 'field before 상태 복원이 일치하지 않습니다.');
           }
+          if (wasm.pageCount !== entry.applyReceipt.pageCountBefore) {
+            throw new DocumentAgentError('PAGE_COUNT_CHANGED', 'field revert 뒤 페이지 수가 다릅니다.');
+          }
+          afterDocumentSha256 = exportDocumentSha256(wasm, state.format);
+          this.assertWithinBudget(startedAt);
+          return position;
         },
         meta: {
           actionId: 'field-agent:revert',
@@ -1565,8 +1841,15 @@ export class DocumentAgentController {
     };
   }
 
-  focusFieldTarget(target: RhwpTableCellTextTargetV1): { focused: boolean; page: number } {
+  focusFieldTarget(target: RhwpFieldTargetV1): { focused: boolean; page: number } {
     this.syncGeneration();
+    if (target.kind === 'form_text') {
+      return this.deps.input.focusFormText(
+        target.section,
+        target.paragraph,
+        target.fieldId,
+      );
+    }
     return this.deps.input.focusTableCellText(
       target.section,
       target.parentPara,

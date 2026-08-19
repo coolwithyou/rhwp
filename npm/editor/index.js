@@ -19,11 +19,11 @@ import {
   validateDocumentChangedEvent,
   validateFocusTargetResult,
   validateFieldCommandReceipt,
+  validateFieldTarget,
   validateFieldSelectionContext,
   validateRevertFieldCommand,
   validateRevertTextCommand,
   validateSelectionContext,
-  validateTableCellTextTarget,
   validateTextCommandReceipt,
 } from './document-agent-contract.js';
 
@@ -300,7 +300,7 @@ export class RhwpEditor {
     return selection;
   }
 
-  /** 현재 캐럿의 exact table cell target을 반환합니다. */
+  /** 현재 캐럿의 exact table cell 또는 본문 누름틀 target을 반환합니다. */
   async getFieldSelectionContext() {
     assertCapability(this._transport, 'field-selection-events-v1');
     const selection = validateFieldSelectionContext(
@@ -341,16 +341,16 @@ export class RhwpEditor {
     }));
   }
 
-  /** exact table cell text target으로 캐럿과 뷰포트를 이동합니다. */
+  /** exact table cell text 또는 본문 누름틀 target으로 캐럿과 뷰포트를 이동합니다. */
   async focusFieldTarget(target) {
     assertCapability(this._transport, 'field-target-navigation-v1');
-    const validTarget = validateTableCellTextTarget(target);
+    const validTarget = validateFieldTarget(target);
     return validateFocusTargetResult(await this._request('focusFieldTarget', {
       target: validTarget,
     }));
   }
 
-  /** exact table cell field를 서버 승인 binding으로 한 트랜잭션에서 교체합니다. */
+  /** exact field를 서버 승인 binding으로 한 트랜잭션에서 교체합니다. */
   async applyFieldCommand(command) {
     assertCapability(this._transport, 'field-agent-command-v1');
     const validCommand = validateApplyFieldCommand(command);

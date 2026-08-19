@@ -8,6 +8,7 @@ import {
   collectTargetEvidence,
   type DocumentAgentWasm,
   type DocumentAgentInput,
+  type RhwpFormFieldEntry,
 } from '../src/document-agent/controller.ts';
 import type {
   RhwpApplyFieldCommandV1,
@@ -41,6 +42,7 @@ class FakeWasm implements DocumentAgentWasm {
     [cellParagraph('항목명')],
     [cellParagraph('기존 값')],
   ];
+  formFields: RhwpFormFieldEntry[] = [];
   replacementPageCount: number | null = null;
 
   getSourceFormat() { return this.sourceFormat; }
@@ -68,11 +70,54 @@ class FakeWasm implements DocumentAgentWasm {
     return { id: this.paragraphs[section][paragraphIndex].styleId, name: '본문' };
   }
   getFieldInfoAt(pos: { sectionIndex: number; paragraphIndex: number; charOffset: number }) {
+    const exactFormField = this.formFields.find(field =>
+      field.location.sectionIndex === pos.sectionIndex
+      && field.location.paraIndex === pos.paragraphIndex
+      && pos.charOffset >= (field.startCharIdx ?? -1)
+      && pos.charOffset <= (field.endCharIdx ?? -1));
+    if (exactFormField) {
+      return {
+        inField: true,
+        fieldId: exactFormField.fieldId,
+        fieldType: exactFormField.fieldType,
+        startCharIdx: exactFormField.startCharIdx,
+        endCharIdx: exactFormField.endCharIdx,
+        editableInForm: exactFormField.editableInForm,
+      };
+    }
     const fields = this.paragraphs[pos.sectionIndex][pos.paragraphIndex].fields;
     const field = fields.find(([start, end]) => pos.charOffset >= start && pos.charOffset <= end);
     return field
       ? { inField: true, startCharIdx: field[0], endCharIdx: field[1] }
       : { inField: false };
+  }
+  getFieldList() { return structuredClone(this.formFields); }
+  getFieldValue(fieldId: number) {
+    const field = this.formFields.find(entry => entry.fieldId === fieldId);
+    return field ? { ok: true, value: field.value } : { ok: false, value: '' };
+  }
+  setFieldValue(fieldId: number, value: string) {
+    const field = this.formFields.find(entry => entry.fieldId === fieldId);
+    if (!field || field.startCharIdx === undefined || field.endCharIdx === undefined) {
+      return { ok: false, fieldId, oldValue: '', newValue: '' };
+    }
+    const paragraph = this.paragraphs[field.location.sectionIndex][field.location.paraIndex];
+    const oldValue = field.value;
+    const chars = Array.from(paragraph.text);
+    const shapes = [...paragraph.charShapeIds];
+    const replacement = Array.from(value);
+    const inheritedShape = shapes[field.startCharIdx] ?? shapes[field.startCharIdx - 1] ?? 4;
+    chars.splice(field.startCharIdx, field.endCharIdx - field.startCharIdx, ...replacement);
+    shapes.splice(
+      field.startCharIdx,
+      field.endCharIdx - field.startCharIdx,
+      ...Array(Math.max(replacement.length, 1)).fill(inheritedShape),
+    );
+    paragraph.text = chars.join('');
+    paragraph.charShapeIds = shapes.slice(0, Math.max(chars.length, 1));
+    field.endCharIdx = field.startCharIdx + replacement.length;
+    field.value = value;
+    return { ok: true, fieldId, oldValue, newValue: value };
   }
   getTextInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number, count: number) {
     return Array.from(this.cells[cellIndex][cellPara].text).slice(offset, offset + count).join('');
@@ -147,11 +192,13 @@ class FakeWasm implements DocumentAgentWasm {
       exportHwp: () => encoder.encode(JSON.stringify({
         paragraphs: this.paragraphs,
         cells: this.cells,
+        formFields: this.formFields,
         pageCount: this.pageCount,
       })),
       exportHwpx: () => encoder.encode(JSON.stringify({
         paragraphs: this.paragraphs,
         cells: this.cells,
+        formFields: this.formFields,
         pageCount: this.pageCount,
       })),
     };
@@ -162,12 +209,14 @@ class FakeWasm implements DocumentAgentWasm {
       pageCount: this.pageCount,
       paragraphs: structuredClone(this.paragraphs),
       cells: structuredClone(this.cells),
+      formFields: structuredClone(this.formFields),
     };
   }
   restoreState(snapshot: ReturnType<FakeWasm['cloneState']>) {
     this.pageCount = snapshot.pageCount;
     this.paragraphs = structuredClone(snapshot.paragraphs);
     this.cells = structuredClone(snapshot.cells);
+    this.formFields = structuredClone(snapshot.formFields);
   }
 }
 
@@ -238,6 +287,19 @@ class FakeInput implements DocumentAgentInput {
       cellParaIndex: cellParagraph,
     };
     return { focused: true, page: 3 };
+  }
+  focusFormText(section: number, paragraphIndex: number, fieldId: number) {
+    const field = this.wasm.formFields.find(entry => entry.fieldId === fieldId)!;
+    this.position = {
+      sectionIndex: section,
+      paragraphIndex,
+      charOffset: field.endCharIdx ?? 0,
+    };
+    this.selection = {
+      start: { sectionIndex: section, paragraphIndex, charOffset: field.startCharIdx ?? 0 },
+      end: { sectionIndex: section, paragraphIndex, charOffset: field.endCharIdx ?? 0 },
+    };
+    return { focused: true, page: 2 };
   }
 }
 
@@ -337,6 +399,51 @@ function fieldCommand(
   };
 }
 
+function installFormTextField(wasm: FakeWasm, value = '기존 회사명') {
+  const prefix = '회사명: ';
+  wasm.paragraphs[0][1] = paragraph(`${prefix}${value} / 확인`);
+  wasm.formFields = [{
+    fieldId: 41,
+    fieldType: 'clickhere',
+    cellField: false,
+    name: '회사명',
+    guide: '회사명을 입력하세요',
+    command: 'field:company-name',
+    value,
+    location: { sectionIndex: 0, paraIndex: 1 },
+    startCharIdx: Array.from(prefix).length,
+    endCharIdx: Array.from(prefix).length + Array.from(value).length,
+    editableInForm: true,
+  }];
+}
+
+function formFieldCommand(
+  controller: DocumentAgentController,
+  wasm: FakeWasm,
+  replacement = '주식회사 노튼',
+): RhwpApplyFieldCommandV1 {
+  const state = controller.getDocumentState();
+  const exactTarget = {
+    kind: 'form_text' as const,
+    section: 0,
+    paragraph: 1,
+    fieldId: 41,
+  };
+  const evidence = collectFieldTargetEvidence(wasm, exactTarget);
+  return {
+    schemaVersion: 1,
+    commandId: 'form-field-cmd-1',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target: exactTarget,
+    expectedBeforeSha256: evidence.textSha256,
+    expectedFormatSha256: evidence.formatSha256,
+    expectedAdjacentContextSha256: evidence.adjacentContextSha256,
+    replacement,
+  };
+}
+
 test('field apply/revert는 exact 셀만 한 트랜잭션으로 변경하고 복원한다', async () => {
   const { controller, wasm, input, events } = harness();
   const replacement = 'AI 기반 사업계획서 작성 서비스';
@@ -363,6 +470,39 @@ test('field apply/revert는 exact 셀만 한 트랜잭션으로 변경하고 복
   assert.equal(input.transactions, 2);
   assert.equal(reverted.afterChangeSeq, 2);
   assert.equal((events[1] as { reason: string }).reason, 'field_agent_revert');
+});
+
+test('form_text apply/revert는 exact 누름틀 값만 변경하고 구조와 문맥을 복원한다', async () => {
+  const { controller, wasm, input, events } = harness();
+  installFormTextField(wasm);
+  const beforeParagraphs = structuredClone(wasm.paragraphs);
+  const command = formFieldCommand(controller, wasm);
+  const beforeEvidence = collectFieldTargetEvidence(wasm, command.target);
+
+  const applied = await controller.applyFieldCommand(command);
+  assert.equal(wasm.getFieldValue(41).value, '주식회사 노튼');
+  assert.equal(wasm.paragraphs[0][1].text, '회사명: 주식회사 노튼 / 확인');
+  assert.equal(applied.adjacentContextSha256, beforeEvidence.adjacentContextSha256);
+  assert.equal(applied.formatSha256, beforeEvidence.formatSha256);
+  assert.equal(input.transactions, 1);
+
+  const reverted = await controller.revertFieldCommand({
+    schemaVersion: 1,
+    commandId: command.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  });
+  assert.equal(wasm.getFieldValue(41).value, '기존 회사명');
+  assert.deepEqual(wasm.paragraphs, beforeParagraphs);
+  assert.equal(reverted.adjacentContextSha256, beforeEvidence.adjacentContextSha256);
+  assert.equal(reverted.formatSha256, beforeEvidence.formatSha256);
+  assert.equal(input.transactions, 2);
+  assert.deepEqual(events.map(event => (event as { reason: string }).reason), [
+    'field_agent_apply',
+    'field_agent_revert',
+  ]);
 });
 
 test('선택 마커 같은 길이 치환은 혼합 글자 서식을 글자별로 보존하고 revert한다', async () => {
@@ -656,4 +796,29 @@ test('field selection context는 현재 표 셀을 exact target으로 노출하�
       cellParagraph: 0,
     },
   });
+});
+
+test('field selection과 focus는 본문 누름틀의 exact fieldId를 노출하고 mutation을 만들지 않는다', () => {
+  const { controller, wasm, input, events } = harness();
+  installFormTextField(wasm);
+  input.position = { sectionIndex: 0, paragraphIndex: 1, charOffset: 7 };
+
+  assert.deepEqual(controller.getFieldSelectionContext(), {
+    schemaVersion: 1,
+    documentEpoch: 1,
+    changeSeq: 0,
+    page: 2,
+    editable: true,
+    target: { kind: 'form_text', section: 0, paragraph: 1, fieldId: 41 },
+  });
+  assert.deepEqual(
+    controller.focusFieldTarget({ kind: 'form_text', section: 0, paragraph: 1, fieldId: 41 }),
+    { focused: true, page: 2 },
+  );
+  assert.deepEqual(input.selection, {
+    start: { sectionIndex: 0, paragraphIndex: 1, charOffset: 5 },
+    end: { sectionIndex: 0, paragraphIndex: 1, charOffset: 11 },
+  });
+  assert.equal(input.transactions, 0);
+  assert.equal(events.length, 0);
 });
