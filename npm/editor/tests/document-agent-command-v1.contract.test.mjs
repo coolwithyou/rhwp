@@ -38,6 +38,16 @@ function formFieldTarget() {
   };
 }
 
+function fieldRegionTarget() {
+  return {
+    kind: 'table_cell_region',
+    section: 0,
+    parentPara: 4,
+    controlIndex: 1,
+    cellIndex: 3,
+  };
+}
+
 function state() {
   return {
     schemaVersion: 1,
@@ -233,6 +243,31 @@ test('문서 에이전트 공개 API는 exact 본문 누름틀 target을 전달�
     { method: 'getFieldSelectionContext', params: {} },
     { method: 'focusFieldTarget', params: { target: formFieldTarget() } },
     { method: 'applyFieldCommand', params: { command: applyFormFieldCommand() } },
+  ]);
+});
+
+test('문서 에이전트 공개 API는 표 셀 장문 target의 줄바꿈을 허용한다', async () => {
+  const command = {
+    ...applyFieldCommand(),
+    commandId: 'field-region-001',
+    target: fieldRegionTarget(),
+    replacement: '첫 문단\n둘째 문단',
+  };
+  const result = {
+    ...fieldReceipt('apply'),
+    commandId: command.commandId,
+    target: fieldRegionTarget(),
+  };
+  const { editor, requests } = editorHarness({
+    focusFieldTarget: { focused: true, page: 3 },
+    applyFieldCommand: result,
+  });
+
+  assert.deepEqual(await editor.focusFieldTarget(fieldRegionTarget()), { focused: true, page: 3 });
+  assert.deepEqual(await editor.applyFieldCommand(command), result);
+  assert.deepEqual(requests, [
+    { method: 'focusFieldTarget', params: { target: fieldRegionTarget() } },
+    { method: 'applyFieldCommand', params: { command } },
   ]);
 });
 

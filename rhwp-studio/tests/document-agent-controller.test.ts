@@ -181,6 +181,32 @@ class FakeWasm implements DocumentAgentWasm {
     this.cells[cellIndex][cellPara].paraShapeId = id;
     return '{}';
   }
+  splitParagraphInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, charOffset: number) {
+    const paragraph = this.cells[cellIndex][cellPara];
+    const chars = Array.from(paragraph.text);
+    const before = chars.slice(0, charOffset).join('');
+    const after = chars.slice(charOffset).join('');
+    const beforeShapes = paragraph.charShapeIds.slice(0, Math.max(charOffset, 1));
+    const afterShapes = paragraph.charShapeIds.slice(charOffset);
+    paragraph.text = before;
+    paragraph.charShapeIds = beforeShapes.length > 0 ? beforeShapes : [7];
+    this.cells[cellIndex].splice(cellPara + 1, 0, {
+      text: after,
+      paraShapeId: paragraph.paraShapeId,
+      charShapeIds: afterShapes.length > 0 ? afterShapes : [paragraph.charShapeIds[0] ?? 7],
+    });
+    return '{}';
+  }
+  mergeParagraphInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number) {
+    const previous = this.cells[cellIndex][cellPara - 1];
+    const [removed] = this.cells[cellIndex].splice(cellPara, 1);
+    previous.text += removed.text;
+    previous.charShapeIds = [
+      ...previous.charShapeIds.slice(0, Math.max(Array.from(previous.text).length - Array.from(removed.text).length, 0)),
+      ...removed.charShapeIds.slice(0, Math.max(Array.from(removed.text).length, 1)),
+    ];
+    return JSON.stringify({ removedParaMeta: {} });
+  }
   beginDeferredPagination() {}
   flushDeferredPagination() {}
   cancelDeferredPagination() {}
@@ -399,6 +425,34 @@ function fieldCommand(
   };
 }
 
+function fieldRegionCommand(
+  controller: DocumentAgentController,
+  wasm: FakeWasm,
+  replacement = '첫 문단\n둘째 문단',
+): RhwpApplyFieldCommandV1 {
+  const state = controller.getDocumentState();
+  const exactTarget = {
+    kind: 'table_cell_region' as const,
+    section: 0,
+    parentPara: 1,
+    controlIndex: 0,
+    cellIndex: 1,
+  };
+  const evidence = collectFieldTargetEvidence(wasm, exactTarget);
+  return {
+    schemaVersion: 1,
+    commandId: 'field-region-cmd-1',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target: exactTarget,
+    expectedBeforeSha256: evidence.textSha256,
+    expectedFormatSha256: evidence.formatSha256,
+    expectedAdjacentContextSha256: evidence.adjacentContextSha256,
+    replacement,
+  };
+}
+
 function installFormTextField(wasm: FakeWasm, value = '기존 회사명') {
   const prefix = '회사명: ';
   wasm.paragraphs[0][1] = paragraph(`${prefix}${value} / 확인`);
@@ -470,6 +524,34 @@ test('field apply/revert는 exact 셀만 한 트랜잭션으로 변경하고 복
   assert.equal(input.transactions, 2);
   assert.equal(reverted.afterChangeSeq, 2);
   assert.equal((events[1] as { reason: string }).reason, 'field_agent_revert');
+});
+
+test('table_cell_region apply/revert는 셀 전체 장문 문단을 변경하고 원문 구조를 복원한다', async () => {
+  const { controller, wasm, input } = harness();
+  wasm.cells[1] = [cellParagraph('기존 첫 문단'), cellParagraph('기존 둘째 문단')];
+  const before = structuredClone(wasm.cells);
+  const command = fieldRegionCommand(controller, wasm, '창업 경험을 바탕으로 문제를 발견했습니다.\n팀의 전문성으로 해결하겠습니다.');
+
+  const applied = await controller.applyFieldCommand(command);
+  assert.deepEqual(wasm.cells[1].map(paragraph => paragraph.text), [
+    '창업 경험을 바탕으로 문제를 발견했습니다.',
+    '팀의 전문성으로 해결하겠습니다.',
+  ]);
+  assert.deepEqual(wasm.cells[0], before[0]);
+  assert.equal(applied.target.kind, 'table_cell_region');
+  assert.equal(input.transactions, 1);
+
+  const reverted = await controller.revertFieldCommand({
+    schemaVersion: 1,
+    commandId: command.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  });
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(reverted.target.kind, 'table_cell_region');
+  assert.equal(input.transactions, 2);
 });
 
 test('form_text apply/revert는 exact 누름틀 값만 변경하고 구조와 문맥을 복원한다', async () => {

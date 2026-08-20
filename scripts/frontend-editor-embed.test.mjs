@@ -28,6 +28,9 @@ test('@rhwp/editor public API uses exact-origin MessageChannel v1 binary transpo
       'selection-context-v1',
       'document-agent-command-v1',
       'target-navigation-v1',
+      'field-target-navigation-v1',
+      'field-agent-command-v1',
+      'field-selection-events-v1',
       'document-change-events-v1',
     ]);
     assert.equal(transfer.length, 1);

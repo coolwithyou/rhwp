@@ -80,6 +80,23 @@ export function validateTableCellTextTarget(value, code = 'INVALID_COMMAND') {
   return target;
 }
 
+export function validateTableCellRegionTarget(value, code = 'INVALID_COMMAND') {
+  const target = record(value, 'target', code);
+  exactKeys(
+    target,
+    ['kind', 'section', 'parentPara', 'controlIndex', 'cellIndex'],
+    'target',
+    code,
+  );
+  if (target.kind !== 'table_cell_region') {
+    throw contractError(code, 'target.kind must be table_cell_region');
+  }
+  for (const key of ['section', 'parentPara', 'controlIndex', 'cellIndex']) {
+    safeInteger(target[key], `target.${key}`, 0, code);
+  }
+  return target;
+}
+
 export function validateFormTextTarget(value, code = 'INVALID_COMMAND') {
   const target = record(value, 'target', code);
   exactKeys(target, ['kind', 'section', 'paragraph', 'fieldId'], 'target', code);
@@ -95,8 +112,9 @@ export function validateFormTextTarget(value, code = 'INVALID_COMMAND') {
 export function validateFieldTarget(value, code = 'INVALID_COMMAND') {
   const target = record(value, 'target', code);
   if (target.kind === 'table_cell_text') return validateTableCellTextTarget(target, code);
+  if (target.kind === 'table_cell_region') return validateTableCellRegionTarget(target, code);
   if (target.kind === 'form_text') return validateFormTextTarget(target, code);
-  throw contractError(code, 'target.kind must be table_cell_text or form_text');
+  throw contractError(code, 'target.kind must be table_cell_text, table_cell_region, or form_text');
 }
 
 export function validateApplyTextCommand(value) {
@@ -131,7 +149,8 @@ export function validateApplyTextCommand(value) {
 
 export function validateApplyFieldCommand(value) {
   const command = validateApplyTextCommandShape(value, validateFieldTarget);
-  if (/\r|\n/u.test(command.replacement)) {
+  if (/\r/u.test(command.replacement)
+      || (command.target.kind !== 'table_cell_region' && /\n/u.test(command.replacement))) {
     throw contractError('INVALID_COMMAND', 'field command replacement must not contain line breaks');
   }
   return command;
@@ -161,7 +180,7 @@ function validateApplyTextCommandShape(value, validateTarget) {
       || Array.from(command.replacement).length > 4000) {
     throw contractError(code, 'command.replacement must be a string with at most 4000 characters');
   }
-  if (/[\u0000-\u001f\u007f]/u.test(command.replacement)) {
+  if (/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/u.test(command.replacement)) {
     throw contractError(code, 'command.replacement must not contain control characters');
   }
   return command;

@@ -17,6 +17,7 @@ import {
   type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
   type RhwpSelectionContextV1,
+  type RhwpTableCellRegionTargetV1,
   type RhwpTableCellTextTargetV1,
   type RhwpTextCommandReceiptV1,
 } from './types.ts';
@@ -157,6 +158,21 @@ export interface DocumentAgentWasm {
     cellIndex: number,
     cellParagraph: number,
     paraShapeId: number,
+  ): string;
+  splitParagraphInCell?(
+    section: number,
+    parentPara: number,
+    controlIndex: number,
+    cellIndex: number,
+    cellParagraph: number,
+    charOffset: number,
+  ): string;
+  mergeParagraphInCell?(
+    section: number,
+    parentPara: number,
+    controlIndex: number,
+    cellIndex: number,
+    cellParagraph: number,
   ): string;
   getPageOfPosition(section: number, paragraph: number): { ok: boolean; page?: number };
   exportHwp(): Uint8Array;
@@ -319,6 +335,122 @@ function replaceWholeFieldTextDeferred(
   );
 }
 
+function replaceWholeTableCellRegion(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellRegionTargetV1,
+  replacement: string,
+  evidence: TargetEvidence,
+): DocumentPosition {
+  if (!wasm.splitParagraphInCell || !wasm.mergeParagraphInCell) {
+    throw new DocumentAgentError(
+      'CAPABILITY_UNSUPPORTED',
+      '현재 편집기 코어는 장문 셀 문단 편집을 지원하지 않습니다.',
+    );
+  }
+  const blocks = replacement.split('\n');
+  if (blocks.some(block => codePointLength(block) > MAX_PARAGRAPH_LENGTH)) {
+    throw new DocumentAgentError('INVALID_COMMAND', '장문 셀의 개별 문단은 4000자 이하여야 합니다.');
+  }
+  const paragraphCount = assertTableCellRegionTargetCoordinates(wasm, target);
+  let deferred = false;
+  try {
+    wasm.beginDeferredPagination?.();
+    deferred = true;
+    for (let cellParagraph = paragraphCount - 1; cellParagraph >= 1; cellParagraph -= 1) {
+      wasm.mergeParagraphInCell(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        cellParagraph,
+      );
+    }
+    const firstTarget: RhwpTableCellTextTargetV1 = {
+      ...target,
+      kind: 'table_cell_text',
+      cellParagraph: 0,
+    };
+    const mergedLength = wasm.getCellParagraphLength(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      0,
+    );
+    const mergedText = mergedLength > 0 ? wasm.getTextInCell(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      0,
+      0,
+      mergedLength,
+    ) : '';
+    const first = replaceWholeFieldTextDeferred(wasm, firstTarget, mergedText, blocks[0] ?? '');
+    if (!first.ok || first.charOffset !== codePointLength(blocks[0] ?? '')) {
+      throw new DocumentAgentError('TRANSACTION_FAILED', '장문 셀의 첫 문단을 교체하지 못했습니다.');
+    }
+    restoreFieldCharShapes(wasm, firstTarget, codePointLength(blocks[0] ?? ''), evidence);
+    wasm.setCellParaShapeId(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      0,
+      evidence.paraShapeId,
+    );
+    for (let index = 1; index < blocks.length; index += 1) {
+      const previous = blocks[index - 1] ?? '';
+      wasm.splitParagraphInCell(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        index - 1,
+        codePointLength(previous),
+      );
+      const block = blocks[index] ?? '';
+      const paragraphTarget: RhwpTableCellTextTargetV1 = {
+        ...target,
+        kind: 'table_cell_text',
+        cellParagraph: index,
+      };
+      if (block) {
+        const inserted = replaceWholeFieldTextDeferred(wasm, paragraphTarget, '', block);
+        if (!inserted.ok || inserted.charOffset !== codePointLength(block)) {
+          throw new DocumentAgentError('TRANSACTION_FAILED', '장문 셀 문단을 삽입하지 못했습니다.');
+        }
+      }
+      restoreFieldCharShapes(wasm, paragraphTarget, codePointLength(block), evidence);
+      wasm.setCellParaShapeId(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        index,
+        evidence.paraShapeId,
+      );
+    }
+    wasm.flushDeferredPagination?.();
+    deferred = false;
+    const lastIndex = Math.max(blocks.length - 1, 0);
+    return {
+      sectionIndex: target.section,
+      paragraphIndex: lastIndex,
+      charOffset: codePointLength(blocks[lastIndex] ?? ''),
+      parentParaIndex: target.parentPara,
+      controlIndex: target.controlIndex,
+      cellIndex: target.cellIndex,
+      cellParaIndex: lastIndex,
+    };
+  } catch (error) {
+    if (deferred) {
+      try { wasm.cancelDeferredPagination?.(); } catch { /* snapshot rollback이 최종 복구한다. */ }
+    }
+    throw error;
+  }
+}
+
 function canRestoreFieldCharShapes(evidence: TargetEvidence, replacementLength: number): boolean {
   return evidence.charShapeIds.every(id => id === evidence.charShapeId)
     || evidence.charShapeIds.length === replacementLength;
@@ -418,6 +550,9 @@ function replaceExactFieldText(
   evidence: TargetEvidence,
 ): DocumentPosition {
   const replacementLength = codePointLength(replacement);
+  if (target.kind === 'table_cell_region') {
+    return replaceWholeTableCellRegion(wasm, target, replacement, evidence);
+  }
   if (target.kind === 'form_text') {
     const result = wasm.setFieldValue(target.fieldId, replacement);
     if (!result.ok
@@ -648,6 +783,48 @@ function assertTableCellTargetCoordinates(
   }
 }
 
+function assertTableCellRegionTargetCoordinates(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellRegionTargetV1,
+): number {
+  try {
+    const dimensions = wasm.getTableDimensions(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+    );
+    if (!Number.isSafeInteger(dimensions.cellCount)
+        || target.cellIndex >= dimensions.cellCount) throw new Error('cell index');
+    const paragraphCount = wasm.getCellParagraphCount(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+    );
+    if (!Number.isSafeInteger(paragraphCount) || paragraphCount < 1) {
+      throw new Error('cell paragraph count');
+    }
+    let totalLength = Math.max(paragraphCount - 1, 0);
+    for (let cellParagraph = 0; cellParagraph < paragraphCount; cellParagraph += 1) {
+      const length = wasm.getCellParagraphLength(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        cellParagraph,
+      );
+      if (!Number.isSafeInteger(length) || length < 0 || length > MAX_PARAGRAPH_LENGTH) {
+        throw new Error('cell paragraph length');
+      }
+      totalLength += length;
+    }
+    if (totalLength > MAX_PARAGRAPH_LENGTH) throw new Error('cell region length');
+    return paragraphCount;
+  } catch {
+    throw new DocumentAgentError('TARGET_NOT_FOUND', 'exact table cell region target을 찾을 수 없습니다.');
+  }
+}
+
 function exactFormField(
   wasm: DocumentAgentWasm,
   target: RhwpFormTextTargetV1,
@@ -846,7 +1023,7 @@ function cellParagraphSemantic(
 
 function fieldNonTargetManifestSha256(
   wasm: DocumentAgentWasm,
-  target: RhwpTableCellTextTargetV1,
+  target: RhwpTableCellTextTargetV1 | RhwpTableCellRegionTargetV1,
 ): string {
   const dimensions = wasm.getTableDimensions(
     target.section,
@@ -863,8 +1040,15 @@ function fieldNonTargetManifestSha256(
     );
     const paragraphs: Array<Record<string, unknown>> = [];
     for (let cellParagraph = 0; cellParagraph < paragraphCount; cellParagraph += 1) {
-      if (cellIndex === target.cellIndex && cellParagraph === target.cellParagraph) continue;
-      paragraphs.push(cellParagraphSemantic(wasm, target, cellIndex, cellParagraph));
+      if (cellIndex === target.cellIndex && (
+        target.kind === 'table_cell_region'
+        || cellParagraph === target.cellParagraph
+      )) continue;
+      paragraphs.push(cellParagraphSemantic(wasm, {
+        ...target,
+        kind: 'table_cell_text',
+        cellParagraph,
+      }, cellIndex, cellParagraph));
     }
     cells.push({
       cellIndex,
@@ -874,7 +1058,9 @@ function fieldNonTargetManifestSha256(
         target.controlIndex,
         cellIndex,
       ),
-      paragraphCount,
+      ...(cellIndex === target.cellIndex && target.kind === 'table_cell_region'
+        ? { targetRegion: true }
+        : { paragraphCount }),
       paragraphs,
     });
   }
@@ -888,6 +1074,83 @@ function fieldNonTargetManifestSha256(
       cells,
     },
   }));
+}
+
+function collectTableCellRegionEvidence(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellRegionTargetV1,
+): TargetEvidence {
+  const paragraphCount = assertTableCellRegionTargetCoordinates(wasm, target);
+  const texts: string[] = [];
+  const allCharShapeIds: number[] = [];
+  let charShapeId: number | null = null;
+  let paraShapeId: number | null = null;
+  for (let cellParagraph = 0; cellParagraph < paragraphCount; cellParagraph += 1) {
+    const paragraphTarget: RhwpTableCellTextTargetV1 = {
+      ...target,
+      kind: 'table_cell_text',
+      cellParagraph,
+    };
+    const length = wasm.getCellParagraphLength(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      cellParagraph,
+    );
+    texts.push(length > 0 ? wasm.getTextInCell(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      cellParagraph,
+      0,
+      length,
+    ) : '');
+    const paragraphCharShapeIds = cellCharShapeRuns(wasm, paragraphTarget, length);
+    const paragraphCharShapeId = paragraphCharShapeIds[0]!;
+    const paragraphParaShapeId = safeId(wasm.getCellParaPropertiesAt(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      cellParagraph,
+    ).paraShapeId, 'cell region paraShapeId');
+    if (!paragraphCharShapeIds.every(id => id === paragraphCharShapeId)
+        || (charShapeId !== null && charShapeId !== paragraphCharShapeId)
+        || (paraShapeId !== null && paraShapeId !== paragraphParaShapeId)) {
+      throw new DocumentAgentError(
+        'TARGET_FORMAT_MISMATCH',
+        '장문 셀은 모든 문단의 글자·문단 서식이 같을 때만 자동 입력할 수 있습니다.',
+      );
+    }
+    charShapeId ??= paragraphCharShapeId;
+    paraShapeId ??= paragraphParaShapeId;
+    allCharShapeIds.push(...paragraphCharShapeIds);
+  }
+  const text = texts.join('\n');
+  const adjacentContextSha256 = fieldNonTargetManifestSha256(wasm, target);
+  return {
+    text,
+    textSha256: digestText(text),
+    formatSha256: digestText(stableJson({
+      schemaVersion: 1,
+      kind: 'table_cell_region',
+      charShape: { kind: 'uniform', id: charShapeId },
+      paraShapeId,
+      cellProperties: wasm.getCellOwnProperties(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+      ),
+    })),
+    adjacentContextSha256,
+    charShapeId: charShapeId!,
+    charShapeIds: allCharShapeIds,
+    paraShapeId: paraShapeId!,
+    styleId: 0,
+  };
 }
 
 /** 서버와 SDK가 같은 exact cell preimage를 결속할 수 있도록 공개하는 field evidence. */
@@ -990,9 +1253,9 @@ export function collectFieldTargetEvidence(
   wasm: DocumentAgentWasm,
   target: RhwpFieldTargetV1,
 ): TargetEvidence {
-  return target.kind === 'form_text'
-    ? collectFormTextTargetEvidence(wasm, target)
-    : collectTableCellTargetEvidence(wasm, target);
+  if (target.kind === 'form_text') return collectFormTextTargetEvidence(wasm, target);
+  if (target.kind === 'table_cell_region') return collectTableCellRegionEvidence(wasm, target);
+  return collectTableCellTargetEvidence(wasm, target);
 }
 
 function nonTargetManifestSha256(
@@ -1650,7 +1913,7 @@ export class DocumentAgentController {
           if (afterEvidence.adjacentContextSha256 !== beforeNonTarget) {
             throw new DocumentAgentError('NON_TARGET_CHANGED', 'field target 밖 문서 내용이 변경되었습니다.');
           }
-          if (wasm.pageCount !== state.pageCount) {
+          if (command.target.kind !== 'table_cell_region' && wasm.pageCount !== state.pageCount) {
             throw new DocumentAgentError('PAGE_COUNT_CHANGED', 'field apply 뒤 페이지 수가 변경되었습니다.');
           }
           afterDocumentSha256 = exportDocumentSha256(wasm, state.format);
@@ -1855,7 +2118,7 @@ export class DocumentAgentController {
       target.parentPara,
       target.controlIndex,
       target.cellIndex,
-      target.cellParagraph,
+      target.kind === 'table_cell_region' ? 0 : target.cellParagraph,
     );
   }
 

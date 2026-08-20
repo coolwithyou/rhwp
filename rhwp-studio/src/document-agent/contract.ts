@@ -7,6 +7,7 @@ import {
   type RhwpFormTextTargetV1,
   type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
+  type RhwpTableCellRegionTargetV1,
   type RhwpTableCellTextTargetV1,
 } from './types.ts';
 
@@ -82,6 +83,19 @@ export function parseTableCellTextTarget(value: unknown): RhwpTableCellTextTarge
   return target as unknown as RhwpTableCellTextTargetV1;
 }
 
+export function parseTableCellRegionTarget(value: unknown): RhwpTableCellRegionTargetV1 {
+  const target = record(value, 'target');
+  exactKeys(target, ['kind', 'section', 'parentPara', 'controlIndex', 'cellIndex'], 'target');
+  if (target.kind !== 'table_cell_region') {
+    throw new DocumentAgentError('INVALID_COMMAND', 'target.kind는 table_cell_region이어야 합니다.');
+  }
+  safeInteger(target.section, 0, 'target.section');
+  safeInteger(target.parentPara, 0, 'target.parentPara');
+  safeInteger(target.controlIndex, 0, 'target.controlIndex');
+  safeInteger(target.cellIndex, 0, 'target.cellIndex');
+  return target as unknown as RhwpTableCellRegionTargetV1;
+}
+
 export function parseFormTextTarget(value: unknown): RhwpFormTextTargetV1 {
   const target = record(value, 'target');
   exactKeys(target, ['kind', 'section', 'paragraph', 'fieldId'], 'target');
@@ -97,10 +111,11 @@ export function parseFormTextTarget(value: unknown): RhwpFormTextTargetV1 {
 export function parseFieldTarget(value: unknown): RhwpFieldTargetV1 {
   const target = record(value, 'target');
   if (target.kind === 'table_cell_text') return parseTableCellTextTarget(target);
+  if (target.kind === 'table_cell_region') return parseTableCellRegionTarget(target);
   if (target.kind === 'form_text') return parseFormTextTarget(target);
   throw new DocumentAgentError(
     'INVALID_COMMAND',
-    'target.kind는 table_cell_text 또는 form_text여야 합니다.',
+    'target.kind는 table_cell_text, table_cell_region 또는 form_text여야 합니다.',
   );
 }
 
@@ -154,10 +169,11 @@ export function parseApplyFieldCommand(value: unknown): RhwpApplyFieldCommandV1 
       || Array.from(command.replacement).length > 4000) {
     throw new DocumentAgentError('INVALID_COMMAND', 'replacement는 4000자 이하 문자열이어야 합니다.');
   }
-  if (/[^\S\r\n]*[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/u.test(command.replacement)) {
+  if (/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/u.test(command.replacement)) {
     throw new DocumentAgentError('INVALID_COMMAND', 'replacement에 control 문자를 넣을 수 없습니다.');
   }
-  if (/\r|\n/u.test(command.replacement)) {
+  if (/\r/u.test(command.replacement)
+      || (target.kind !== 'table_cell_region' && /\n/u.test(command.replacement))) {
     throw new DocumentAgentError('INVALID_COMMAND', 'atomic text field에는 줄바꿈을 넣을 수 없습니다.');
   }
   return { ...command, target } as unknown as RhwpApplyFieldCommandV1;

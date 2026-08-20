@@ -217,6 +217,14 @@ export interface RhwpTableCellTextTargetV1 {
   cellParagraph: number;
 }
 
+export interface RhwpTableCellRegionTargetV1 {
+  kind: 'table_cell_region';
+  section: number;
+  parentPara: number;
+  controlIndex: number;
+  cellIndex: number;
+}
+
 export interface RhwpFormTextTargetV1 {
   kind: 'form_text';
   section: number;
@@ -224,7 +232,10 @@ export interface RhwpFormTextTargetV1 {
   fieldId: number;
 }
 
-export type RhwpFieldTargetV1 = RhwpTableCellTextTargetV1 | RhwpFormTextTargetV1;
+export type RhwpFieldTargetV1 =
+  | RhwpTableCellTextTargetV1
+  | RhwpTableCellRegionTargetV1
+  | RhwpFormTextTargetV1;
 
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;

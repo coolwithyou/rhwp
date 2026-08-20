@@ -16,6 +16,15 @@ export interface RhwpTableCellTextTargetV1 {
   cellParagraph: number;
 }
 
+/** 서버가 current revision에서 확정한 표 셀 전체 장문 입력 영역. */
+export interface RhwpTableCellRegionTargetV1 {
+  kind: 'table_cell_region';
+  section: number;
+  parentPara: number;
+  controlIndex: number;
+  cellIndex: number;
+}
+
 /** 서버가 current revision에서 확정한 본문 누름틀 입력 위치. */
 export interface RhwpFormTextTargetV1 {
   kind: 'form_text';
@@ -24,7 +33,10 @@ export interface RhwpFormTextTargetV1 {
   fieldId: number;
 }
 
-export type RhwpFieldTargetV1 = RhwpTableCellTextTargetV1 | RhwpFormTextTargetV1;
+export type RhwpFieldTargetV1 =
+  | RhwpTableCellTextTargetV1
+  | RhwpTableCellRegionTargetV1
+  | RhwpFormTextTargetV1;
 
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
