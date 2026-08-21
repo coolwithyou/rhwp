@@ -232,6 +232,12 @@ export interface TargetEvidence {
   charShapeIds: number[];
   paraShapeId: number;
   styleId: number;
+  /** 장문 셀 revert에서 원래 문단별 서식을 exact 복원하기 위한 세션 내부 snapshot. */
+  regionParagraphFormats?: Array<{
+    length: number;
+    charShapeIds: number[];
+    paraShapeId: number;
+  }>;
 }
 
 interface AgentJournalEntry {
@@ -352,6 +358,7 @@ function replaceWholeTableCellRegion(
     throw new DocumentAgentError('INVALID_COMMAND', '장문 셀의 개별 문단은 4000자 이하여야 합니다.');
   }
   const paragraphCount = assertTableCellRegionTargetCoordinates(wasm, target);
+  const exactParagraphFormats = exactRegionParagraphFormats(evidence, blocks);
   let deferred = false;
   try {
     wasm.beginDeferredPagination?.();
@@ -390,14 +397,12 @@ function replaceWholeTableCellRegion(
     if (!first.ok || first.charOffset !== codePointLength(blocks[0] ?? '')) {
       throw new DocumentAgentError('TRANSACTION_FAILED', '장문 셀의 첫 문단을 교체하지 못했습니다.');
     }
-    restoreFieldCharShapes(wasm, firstTarget, codePointLength(blocks[0] ?? ''), evidence);
-    wasm.setCellParaShapeId(
-      target.section,
-      target.parentPara,
-      target.controlIndex,
-      target.cellIndex,
-      0,
-      evidence.paraShapeId,
+    restoreRegionParagraphFormat(
+      wasm,
+      firstTarget,
+      codePointLength(blocks[0] ?? ''),
+      exactParagraphFormats?.[0],
+      evidence,
     );
     for (let index = 1; index < blocks.length; index += 1) {
       const previous = blocks[index - 1] ?? '';
@@ -421,14 +426,12 @@ function replaceWholeTableCellRegion(
           throw new DocumentAgentError('TRANSACTION_FAILED', '장문 셀 문단을 삽입하지 못했습니다.');
         }
       }
-      restoreFieldCharShapes(wasm, paragraphTarget, codePointLength(block), evidence);
-      wasm.setCellParaShapeId(
-        target.section,
-        target.parentPara,
-        target.controlIndex,
-        target.cellIndex,
-        index,
-        evidence.paraShapeId,
+      restoreRegionParagraphFormat(
+        wasm,
+        paragraphTarget,
+        codePointLength(block),
+        exactParagraphFormats?.[index],
+        evidence,
       );
     }
     wasm.flushDeferredPagination?.();
@@ -448,6 +451,74 @@ function replaceWholeTableCellRegion(
       try { wasm.cancelDeferredPagination?.(); } catch { /* snapshot rollback이 최종 복구한다. */ }
     }
     throw error;
+  }
+}
+
+function exactRegionParagraphFormats(
+  evidence: TargetEvidence,
+  blocks: readonly string[],
+): TargetEvidence['regionParagraphFormats'] | null {
+  const formats = evidence.regionParagraphFormats;
+  if (!formats || formats.length !== blocks.length) return null;
+  return formats.every((format, index) => format.length === codePointLength(blocks[index] ?? ''))
+    ? formats
+    : null;
+}
+
+function restoreRegionParagraphFormat(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  replacementLength: number,
+  exact: NonNullable<TargetEvidence['regionParagraphFormats']>[number] | undefined,
+  evidence: TargetEvidence,
+): void {
+  if (replacementLength > 0) {
+    if (exact && exact.charShapeIds.length === replacementLength) {
+      restoreExactCellCharShapeIds(wasm, target, exact.charShapeIds);
+    } else {
+      wasm.setCharShapeIdInCell(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        target.cellParagraph,
+        0,
+        replacementLength,
+        evidence.charShapeId,
+      );
+    }
+  }
+  wasm.setCellParaShapeId(
+    target.section,
+    target.parentPara,
+    target.controlIndex,
+    target.cellIndex,
+    target.cellParagraph,
+    exact?.paraShapeId ?? evidence.paraShapeId,
+  );
+}
+
+function restoreExactCellCharShapeIds(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  ids: readonly number[],
+): void {
+  let runStart = 0;
+  while (runStart < ids.length) {
+    const id = ids[runStart]!;
+    let runEnd = runStart + 1;
+    while (runEnd < ids.length && ids[runEnd] === id) runEnd += 1;
+    wasm.setCharShapeIdInCell(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      target.cellParagraph,
+      runStart,
+      runEnd,
+      id,
+    );
+    runStart = runEnd;
   }
 }
 
@@ -1083,8 +1154,8 @@ function collectTableCellRegionEvidence(
   const paragraphCount = assertTableCellRegionTargetCoordinates(wasm, target);
   const texts: string[] = [];
   const allCharShapeIds: number[] = [];
-  let charShapeId: number | null = null;
-  let paraShapeId: number | null = null;
+  const paraShapeIds: number[] = [];
+  const regionParagraphFormats: NonNullable<TargetEvidence['regionParagraphFormats']> = [];
   for (let cellParagraph = 0; cellParagraph < paragraphCount; cellParagraph += 1) {
     const paragraphTarget: RhwpTableCellTextTargetV1 = {
       ...target,
@@ -1108,7 +1179,6 @@ function collectTableCellRegionEvidence(
       length,
     ) : '');
     const paragraphCharShapeIds = cellCharShapeRuns(wasm, paragraphTarget, length);
-    const paragraphCharShapeId = paragraphCharShapeIds[0]!;
     const paragraphParaShapeId = safeId(wasm.getCellParaPropertiesAt(
       target.section,
       target.parentPara,
@@ -1116,18 +1186,16 @@ function collectTableCellRegionEvidence(
       target.cellIndex,
       cellParagraph,
     ).paraShapeId, 'cell region paraShapeId');
-    if (!paragraphCharShapeIds.every(id => id === paragraphCharShapeId)
-        || (charShapeId !== null && charShapeId !== paragraphCharShapeId)
-        || (paraShapeId !== null && paraShapeId !== paragraphParaShapeId)) {
-      throw new DocumentAgentError(
-        'TARGET_FORMAT_MISMATCH',
-        '장문 셀은 모든 문단의 글자·문단 서식이 같을 때만 자동 입력할 수 있습니다.',
-      );
-    }
-    charShapeId ??= paragraphCharShapeId;
-    paraShapeId ??= paragraphParaShapeId;
     allCharShapeIds.push(...paragraphCharShapeIds);
+    paraShapeIds.push(paragraphParaShapeId);
+    regionParagraphFormats.push({
+      length,
+      charShapeIds: paragraphCharShapeIds.slice(0, length),
+      paraShapeId: paragraphParaShapeId,
+    });
   }
+  const charShapeId = dominantId(allCharShapeIds, 'cell region charShapeId');
+  const paraShapeId = dominantId(paraShapeIds, 'cell region paraShapeId');
   const text = texts.join('\n');
   const adjacentContextSha256 = fieldNonTargetManifestSha256(wasm, target);
   return {
@@ -1136,7 +1204,7 @@ function collectTableCellRegionEvidence(
     formatSha256: digestText(stableJson({
       schemaVersion: 1,
       kind: 'table_cell_region',
-      charShape: { kind: 'uniform', id: charShapeId },
+      charShape: { kind: 'canonical', id: charShapeId },
       paraShapeId,
       cellProperties: wasm.getCellOwnProperties(
         target.section,
@@ -1146,11 +1214,28 @@ function collectTableCellRegionEvidence(
       ),
     })),
     adjacentContextSha256,
-    charShapeId: charShapeId!,
+    charShapeId,
     charShapeIds: allCharShapeIds,
-    paraShapeId: paraShapeId!,
+    paraShapeId,
     styleId: 0,
+    regionParagraphFormats,
   };
+}
+
+function dominantId(ids: readonly number[], label: string): number {
+  if (ids.length === 0) throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', `${label}가 없습니다.`);
+  const counts = new Map<number, number>();
+  let selected = ids[0]!;
+  let selectedCount = 0;
+  for (const id of ids) {
+    const count = (counts.get(id) ?? 0) + 1;
+    counts.set(id, count);
+    if (count > selectedCount) {
+      selected = id;
+      selectedCount = count;
+    }
+  }
+  return selected;
 }
 
 /** 서버와 SDK가 같은 exact cell preimage를 결속할 수 있도록 공개하는 field evidence. */
@@ -1879,7 +1964,8 @@ export class DocumentAgentController {
     }
     const beforeNonTarget = beforeEvidence.adjacentContextSha256;
     const replacementLength = codePointLength(command.replacement);
-    if (!canRestoreFieldCharShapes(beforeEvidence, replacementLength)) {
+    if (command.target.kind !== 'table_cell_region'
+        && !canRestoreFieldCharShapes(beforeEvidence, replacementLength)) {
       throw new DocumentAgentError(
         'TARGET_FORMAT_MISMATCH',
         '혼합 글자 서식 셀은 같은 길이의 exact 치환만 지원합니다.',

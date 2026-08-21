@@ -554,6 +554,38 @@ test('table_cell_region apply/revert는 셀 전체 장문 문단을 변경하고
   assert.equal(input.transactions, 2);
 });
 
+test('table_cell_region은 안내문 혼합 서식을 canonical 본문으로 적용하고 revert에서 exact 복원한다', async () => {
+  const { controller, wasm, input } = harness();
+  const first = cellParagraph('※ 안내 본문');
+  first.charShapeIds = [37, 37, ...Array(Array.from(first.text).length - 2).fill(40)];
+  first.paraShapeId = 0;
+  const second = cellParagraph('※ 둘째 안내');
+  second.charShapeIds = Array(Array.from(second.text).length).fill(37);
+  second.paraShapeId = 35;
+  wasm.cells[1] = [first, second];
+  const before = structuredClone(wasm.cells);
+  const command = fieldRegionCommand(controller, wasm, '사용자 사실을 바탕으로 작성한 첫 문단\n검증 가능한 두 번째 문단');
+
+  const applied = await controller.applyFieldCommand(command);
+  assert.deepEqual(wasm.cells[1].map(paragraph => paragraph.text), [
+    '사용자 사실을 바탕으로 작성한 첫 문단',
+    '검증 가능한 두 번째 문단',
+  ]);
+  assert.ok(wasm.cells[1].every(paragraph => paragraph.charShapeIds.every(id => id === 37 || id === 40)));
+  assert.equal(input.transactions, 1);
+
+  await controller.revertFieldCommand({
+    schemaVersion: 1,
+    commandId: command.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  });
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(input.transactions, 2);
+});
+
 test('form_text apply/revert는 exact 누름틀 값만 변경하고 구조와 문맥을 복원한다', async () => {
   const { controller, wasm, input, events } = harness();
   installFormTextField(wasm);
