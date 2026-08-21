@@ -495,6 +495,21 @@ test('CanvasView notifies the renderer of the document boundary', () => {
   );
 });
 
+test('CanvasView invalidates static layers for every document-agent mutation', () => {
+  const source = readFileSync(new URL('../src/view/canvas-view.ts', import.meta.url), 'utf8');
+  const refreshStart = source.indexOf('  async refreshDocumentAgentMutation(): Promise<void> {');
+  assert.ok(refreshStart >= 0, 'document-agent strict render 경계가 있어야 한다');
+  const refreshBody = source.slice(
+    refreshStart,
+    refreshStart + source.slice(refreshStart).indexOf('\n  }'),
+  );
+  assert.match(
+    refreshBody,
+    /this\.pageRenderer\.invalidateDocumentRevision\(\);[\s\S]*this\.refreshPages\(\);/,
+    'apply/revert마다 이전 static layer를 폐기한 뒤 다시 그려야 한다',
+  );
+});
+
 // [#3315 P1] object URL 캐시를 편집 경로에서 비우면 캐시가 없는 것과 같아진다.
 // `invalidateDocumentRevision` 은 renderer decision key 에 묶여 같은 문서 편집마다 불리므로
 // (canvas-view.ts 의 `decisionChanged && !changed`), 그 자리에서 회수해서는 안 된다.

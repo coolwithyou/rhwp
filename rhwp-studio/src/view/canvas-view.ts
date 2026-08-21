@@ -192,6 +192,9 @@ export class CanvasView {
     if (!selected || !this.rendererSession.isCurrent(selected.selection)) {
       throw new Error('document-agent renderer revision을 선택하지 못했습니다.');
     }
+    // apply 직후의 static layer를 revert가 재사용하면 export bytes는 복원됐어도
+    // 캔버스에는 이전 문장이 남아 보인다. exact agent mutation은 항상 새 revision이다.
+    this.pageRenderer.invalidateDocumentRevision();
     this.refreshPages();
     const scrollY = this.viewportManager.getScrollY();
     const viewport = this.viewportManager.getViewportSize();
