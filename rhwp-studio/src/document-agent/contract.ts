@@ -4,6 +4,7 @@ import {
   type RhwpApplyTextCommandV1,
   type RhwpBodyParagraphTargetV1,
   type RhwpFieldTargetV1,
+  type RhwpFieldRestoreFormatV1,
   type RhwpFormTextTargetV1,
   type RhwpRevertFieldCommandV1,
   type RhwpRevertTextCommandV1,
@@ -119,6 +120,58 @@ export function parseFieldTarget(value: unknown): RhwpFieldTargetV1 {
   );
 }
 
+function restoreCharShapeIds(value: unknown, label: string): number[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4000) {
+    throw new DocumentAgentError('INVALID_COMMAND', `${label}가 올바르지 않습니다.`);
+  }
+  for (const [index, id] of value.entries()) safeInteger(id, 0, `${label}[${index}]`);
+  return value as number[];
+}
+
+function parseFieldRestoreFormat(value: unknown, target: RhwpFieldTargetV1): RhwpFieldRestoreFormatV1 {
+  const format = record(value, 'replacementFormat');
+  if (format.kind !== target.kind) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'replacementFormat kind가 target과 다릅니다.');
+  }
+  if (format.kind === 'table_cell_region') {
+    exactKeys(format, ['kind', 'paragraphs'], 'replacementFormat');
+    if (!Array.isArray(format.paragraphs) || format.paragraphs.length < 1 || format.paragraphs.length > 100) {
+      throw new DocumentAgentError('INVALID_COMMAND', 'replacementFormat.paragraphs가 올바르지 않습니다.');
+    }
+    const paragraphs = format.paragraphs.map((value, index) => {
+      const paragraph = record(value, `replacementFormat.paragraphs[${index}]`);
+      exactKeys(paragraph, ['length', 'charShapeIds', 'paraShapeId'], `replacementFormat.paragraphs[${index}]`);
+      safeInteger(paragraph.length, 0, `replacementFormat.paragraphs[${index}].length`);
+      safeInteger(paragraph.paraShapeId, 0, `replacementFormat.paragraphs[${index}].paraShapeId`);
+      return {
+        length: paragraph.length,
+        charShapeIds: restoreCharShapeIds(
+          paragraph.charShapeIds,
+          `replacementFormat.paragraphs[${index}].charShapeIds`,
+        ),
+        paraShapeId: paragraph.paraShapeId,
+      };
+    });
+    return { kind: 'table_cell_region', paragraphs };
+  }
+  const allowed = format.kind === 'form_text'
+    ? ['kind', 'charShapeIds', 'paraShapeId', 'styleId']
+    : ['kind', 'charShapeIds', 'paraShapeId'];
+  exactKeys(format, allowed, 'replacementFormat');
+  safeInteger(format.paraShapeId, 0, 'replacementFormat.paraShapeId');
+  const charShapeIds = restoreCharShapeIds(format.charShapeIds, 'replacementFormat.charShapeIds');
+  if (format.kind === 'form_text') {
+    safeInteger(format.styleId, 0, 'replacementFormat.styleId');
+    return {
+      kind: 'form_text',
+      charShapeIds,
+      paraShapeId: format.paraShapeId,
+      styleId: format.styleId,
+    };
+  }
+  return { kind: 'table_cell_text', charShapeIds, paraShapeId: format.paraShapeId };
+}
+
 export function parseApplyTextCommand(value: unknown): RhwpApplyTextCommandV1 {
   const command = record(value, 'command');
   exactKeys(command, [
@@ -149,11 +202,17 @@ export function parseApplyTextCommand(value: unknown): RhwpApplyTextCommandV1 {
 
 export function parseApplyFieldCommand(value: unknown): RhwpApplyFieldCommandV1 {
   const command = record(value, 'command');
-  exactKeys(command, [
+  const allowedKeys = [
     'schemaVersion', 'commandId', 'expectedDocumentEpoch', 'expectedChangeSeq',
     'expectedDocumentSha256', 'target', 'expectedBeforeSha256',
     'expectedFormatSha256', 'expectedAdjacentContextSha256', 'replacement',
-  ], 'command');
+  ];
+  const optionalKeys = [
+    ...(command.replacementStyle === undefined ? [] : ['replacementStyle']),
+    ...(command.replacementFormat === undefined ? [] : ['replacementFormat']),
+    ...(command.expectedReplacementFormatSha256 === undefined ? [] : ['expectedReplacementFormatSha256']),
+  ];
+  exactKeys(command, [...allowedKeys, ...optionalKeys], 'command');
   if (command.schemaVersion !== 1) {
     throw new DocumentAgentError('INVALID_COMMAND', 'schemaVersion은 1이어야 합니다.');
   }
@@ -175,6 +234,31 @@ export function parseApplyFieldCommand(value: unknown): RhwpApplyFieldCommandV1 
   if (/\r/u.test(command.replacement)
       || (target.kind !== 'table_cell_region' && /\n/u.test(command.replacement))) {
     throw new DocumentAgentError('INVALID_COMMAND', 'atomic text field에는 줄바꿈을 넣을 수 없습니다.');
+  }
+  if (command.replacementStyle !== undefined
+      && command.replacementStyle !== 'actual-input'
+      && command.replacementStyle !== 'preserve'
+      && command.replacementStyle !== 'restore-exact') {
+    throw new DocumentAgentError('INVALID_COMMAND', 'replacementStyle이 올바르지 않습니다.');
+  }
+  if (command.replacementStyle === 'restore-exact') {
+    digest(command.expectedReplacementFormatSha256, 'expectedReplacementFormatSha256');
+    const replacementFormat = parseFieldRestoreFormat(command.replacementFormat, target);
+    const lengths = target.kind === 'table_cell_region'
+      ? command.replacement.split('\n').map(part => Array.from(part).length)
+      : [Array.from(command.replacement).length];
+    const formats = replacementFormat.kind === 'table_cell_region'
+      ? replacementFormat.paragraphs
+      : [{ length: lengths[0]!, charShapeIds: replacementFormat.charShapeIds }];
+    if (formats.length !== lengths.length || formats.some((format, index) =>
+      format.length !== lengths[index]
+      || format.charShapeIds.length !== Math.max(lengths[index]!, 1))) {
+      throw new DocumentAgentError('INVALID_COMMAND', 'replacementFormat 길이가 replacement와 다릅니다.');
+    }
+    return { ...command, target, replacementFormat } as unknown as RhwpApplyFieldCommandV1;
+  }
+  if (command.replacementFormat !== undefined || command.expectedReplacementFormatSha256 !== undefined) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'exact 복원 서식은 restore-exact 명령에서만 사용할 수 있습니다.');
   }
   return { ...command, target } as unknown as RhwpApplyFieldCommandV1;
 }

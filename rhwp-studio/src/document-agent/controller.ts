@@ -11,6 +11,7 @@ import {
   type RhwpBodyParagraphTargetV1,
   type RhwpDocumentStateV1,
   type RhwpFieldCommandReceiptV1,
+  type RhwpFieldRestoreFormatV1,
   type RhwpFieldSelectionContextV1,
   type RhwpFieldTargetV1,
   type RhwpFormTextTargetV1,
@@ -40,7 +41,11 @@ export interface DocumentAgentWasm {
   getParagraphLength(section: number, paragraph: number): number;
   getTextRange(section: number, paragraph: number, offset: number, count: number): string;
   getControlTextPositions(section: number, paragraph: number): number[];
-  getCharPropertiesAt(section: number, paragraph: number, offset: number): { charShapeId?: number };
+  getCharPropertiesAt(section: number, paragraph: number, offset: number): {
+    charShapeId?: number;
+    textColor?: string;
+    italic?: boolean;
+  };
   getParaPropertiesAt(section: number, paragraph: number): { paraShapeId?: number };
   getStyleAt(section: number, paragraph: number): { id: number; name: string };
   getFieldInfoAt(position: DocumentPosition): FieldInfoResult;
@@ -79,7 +84,7 @@ export interface DocumentAgentWasm {
     cellIndex: number,
     cellParagraph: number,
     offset: number,
-  ): { charShapeId?: number };
+  ): { charShapeId?: number; textColor?: string; italic?: boolean };
   getCellParaPropertiesAt(
     section: number,
     parentPara: number,
@@ -111,6 +116,13 @@ export interface DocumentAgentWasm {
     start: number,
     end: number,
     charShapeId: number,
+  ): string;
+  applyCharFormat(
+    section: number,
+    paragraph: number,
+    start: number,
+    end: number,
+    propsJson: string,
   ): string;
   setParaShapeId(section: number, paragraph: number, paraShapeId: number): string;
   replaceTextInCellDeferredPagination(
@@ -150,6 +162,16 @@ export interface DocumentAgentWasm {
     start: number,
     end: number,
     charShapeId: number,
+  ): string;
+  applyCharFormatInCell(
+    section: number,
+    parentPara: number,
+    controlIndex: number,
+    cellIndex: number,
+    cellParagraph: number,
+    start: number,
+    end: number,
+    propsJson: string,
   ): string;
   setCellParaShapeId(
     section: number,
@@ -346,6 +368,7 @@ function replaceWholeTableCellRegion(
   target: RhwpTableCellRegionTargetV1,
   replacement: string,
   evidence: TargetEvidence,
+  visualStyle: 'actual-input' | 'preserve',
 ): DocumentPosition {
   if (!wasm.splitParagraphInCell || !wasm.mergeParagraphInCell) {
     throw new DocumentAgentError(
@@ -404,6 +427,9 @@ function replaceWholeTableCellRegion(
       exactParagraphFormats?.[0],
       evidence,
     );
+    if (visualStyle === 'actual-input') {
+      applyActualInputStyleInCell(wasm, firstTarget, codePointLength(blocks[0] ?? ''));
+    }
     for (let index = 1; index < blocks.length; index += 1) {
       const previous = blocks[index - 1] ?? '';
       wasm.splitParagraphInCell(
@@ -433,6 +459,9 @@ function replaceWholeTableCellRegion(
         exactParagraphFormats?.[index],
         evidence,
       );
+      if (visualStyle === 'actual-input') {
+        applyActualInputStyleInCell(wasm, paragraphTarget, codePointLength(block));
+      }
     }
     wasm.flushDeferredPagination?.();
     deferred = false;
@@ -520,6 +549,137 @@ function restoreExactCellCharShapeIds(
     );
     runStart = runEnd;
   }
+}
+
+const ACTUAL_INPUT_CHAR_FORMAT = JSON.stringify({ textColor: '#000000', italic: false });
+
+function applyActualInputStyleInCell(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  replacementLength: number,
+): void {
+  if (replacementLength === 0) return;
+  let needsNormalization = false;
+  for (let offset = 0; offset < replacementLength; offset += 1) {
+    const properties = wasm.getCellCharPropertiesAt(
+      target.section,
+      target.parentPara,
+      target.controlIndex,
+      target.cellIndex,
+      target.cellParagraph,
+      offset,
+    );
+    if (properties.textColor?.toLocaleLowerCase('en-US') !== '#000000' || properties.italic === true) {
+      needsNormalization = true;
+      break;
+    }
+  }
+  if (!needsNormalization) return;
+  wasm.applyCharFormatInCell(
+    target.section,
+    target.parentPara,
+    target.controlIndex,
+    target.cellIndex,
+    target.cellParagraph,
+    0,
+    replacementLength,
+    ACTUAL_INPUT_CHAR_FORMAT,
+  );
+}
+
+function applyActualInputStyleInForm(
+  wasm: DocumentAgentWasm,
+  target: RhwpFormTextTargetV1,
+  start: number,
+  replacementLength: number,
+): void {
+  if (replacementLength === 0) return;
+  let needsNormalization = false;
+  for (let offset = start; offset < start + replacementLength; offset += 1) {
+    const properties = wasm.getCharPropertiesAt(target.section, target.paragraph, offset);
+    if (properties.textColor?.toLocaleLowerCase('en-US') !== '#000000' || properties.italic === true) {
+      needsNormalization = true;
+      break;
+    }
+  }
+  if (!needsNormalization) return;
+  wasm.applyCharFormat(
+    target.section,
+    target.paragraph,
+    start,
+    start + replacementLength,
+    ACTUAL_INPUT_CHAR_FORMAT,
+  );
+}
+
+function assertActualInputStyle(
+  wasm: DocumentAgentWasm,
+  target: RhwpFieldTargetV1,
+  replacement: string,
+): void {
+  const assertProperties = (properties: { textColor?: string; italic?: boolean }) => {
+    if (properties.textColor?.toLocaleLowerCase('en-US') !== '#000000' || properties.italic === true) {
+      throw new DocumentAgentError(
+        'TARGET_FORMAT_MISMATCH',
+        'AI 입력 본문이 검은색 실제 입력 서식으로 적용되지 않았습니다.',
+      );
+    }
+  };
+  if (target.kind === 'form_text') {
+    const field = exactFormField(wasm, target);
+    for (let offset = field.startCharIdx; offset < field.endCharIdx; offset += 1) {
+      assertProperties(wasm.getCharPropertiesAt(target.section, target.paragraph, offset));
+    }
+    return;
+  }
+  const blocks = target.kind === 'table_cell_region' ? replacement.split('\n') : [replacement];
+  for (let cellParagraph = 0; cellParagraph < blocks.length; cellParagraph += 1) {
+    const blockLength = codePointLength(blocks[cellParagraph] ?? '');
+    for (let offset = 0; offset < blockLength; offset += 1) {
+      assertProperties(wasm.getCellCharPropertiesAt(
+        target.section,
+        target.parentPara,
+        target.controlIndex,
+        target.cellIndex,
+        target.kind === 'table_cell_region' ? cellParagraph : target.cellParagraph,
+        offset,
+      ));
+    }
+  }
+}
+
+function exactRestoreEvidence(
+  beforeEvidence: TargetEvidence,
+  target: RhwpFieldTargetV1,
+  format: RhwpFieldRestoreFormatV1 | undefined,
+): TargetEvidence {
+  if (!format || format.kind !== target.kind) {
+    throw new DocumentAgentError('INVALID_COMMAND', 'exact 복원 서식이 target과 다릅니다.');
+  }
+  if (format.kind === 'table_cell_region') {
+    const charShapeIds = format.paragraphs.flatMap(paragraph => paragraph.charShapeIds);
+    return {
+      ...beforeEvidence,
+      charShapeId: dominantId(charShapeIds, 'restore cell region charShapeId'),
+      charShapeIds,
+      paraShapeId: dominantId(
+        format.paragraphs.map(paragraph => paragraph.paraShapeId),
+        'restore cell region paraShapeId',
+      ),
+      regionParagraphFormats: format.paragraphs.map(paragraph => ({
+        length: paragraph.length,
+        charShapeIds: [...paragraph.charShapeIds],
+        paraShapeId: paragraph.paraShapeId,
+      })),
+    };
+  }
+  return {
+    ...beforeEvidence,
+    charShapeId: format.charShapeIds[0]!,
+    charShapeIds: [...format.charShapeIds],
+    paraShapeId: format.paraShapeId,
+    styleId: format.kind === 'form_text' ? format.styleId : beforeEvidence.styleId,
+  };
 }
 
 function canRestoreFieldCharShapes(evidence: TargetEvidence, replacementLength: number): boolean {
@@ -619,10 +779,11 @@ function replaceExactFieldText(
   beforeText: string,
   replacement: string,
   evidence: TargetEvidence,
+  visualStyle: 'actual-input' | 'preserve',
 ): DocumentPosition {
   const replacementLength = codePointLength(replacement);
   if (target.kind === 'table_cell_region') {
-    return replaceWholeTableCellRegion(wasm, target, replacement, evidence);
+    return replaceWholeTableCellRegion(wasm, target, replacement, evidence, visualStyle);
   }
   if (target.kind === 'form_text') {
     const result = wasm.setFieldValue(target.fieldId, replacement);
@@ -634,6 +795,9 @@ function replaceExactFieldText(
     }
     const field = exactFormField(wasm, target);
     restoreFormTextCharShapes(wasm, target, field.startCharIdx, replacementLength, evidence);
+    if (visualStyle === 'actual-input') {
+      applyActualInputStyleInForm(wasm, target, field.startCharIdx, replacementLength);
+    }
     wasm.setParaShapeId(target.section, target.paragraph, evidence.paraShapeId);
     return {
       sectionIndex: target.section,
@@ -651,6 +815,9 @@ function replaceExactFieldText(
       throw new DocumentAgentError('TRANSACTION_FAILED', 'field target 셀 텍스트를 교체하지 못했습니다.');
     }
     restoreFieldCharShapes(wasm, target, replacementLength, evidence);
+    if (visualStyle === 'actual-input') {
+      applyActualInputStyleInCell(wasm, target, replacementLength);
+    }
     wasm.setCellParaShapeId(
       target.section,
       target.parentPara,
@@ -1963,6 +2130,9 @@ export class DocumentAgentController {
       throw new DocumentAgentError('TARGET_CONTEXT_MISMATCH', 'field target context SHA가 다릅니다.');
     }
     const beforeNonTarget = beforeEvidence.adjacentContextSha256;
+    const replacementEvidence = command.replacementStyle === 'restore-exact'
+      ? exactRestoreEvidence(beforeEvidence, command.target, command.replacementFormat)
+      : beforeEvidence;
     const replacementLength = codePointLength(command.replacement);
     if (command.target.kind !== 'table_cell_region'
         && !canRestoreFieldCharShapes(beforeEvidence, replacementLength)) {
@@ -1987,13 +2157,20 @@ export class DocumentAgentController {
             command.target,
             beforeEvidence.text,
             command.replacement,
-            beforeEvidence,
+            replacementEvidence,
+            command.replacementStyle === 'actual-input' ? 'actual-input' : 'preserve',
           );
           afterEvidence = collectFieldTargetEvidence(wasm, command.target);
           if (afterEvidence.text !== command.replacement) {
             throw new DocumentAgentError('TARGET_PREIMAGE_MISMATCH', 'field target postimage가 replacement와 다릅니다.');
           }
-          if (afterEvidence.formatSha256 !== beforeEvidence.formatSha256) {
+          if (command.replacementStyle === 'actual-input') {
+            assertActualInputStyle(wasm, command.target, command.replacement);
+          } else if (command.replacementStyle === 'restore-exact') {
+            if (afterEvidence.formatSha256 !== command.expectedReplacementFormatSha256) {
+              throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', 'field target exact 복원 서식이 다릅니다.');
+            }
+          } else if (afterEvidence.formatSha256 !== beforeEvidence.formatSha256) {
             throw new DocumentAgentError('TARGET_FORMAT_MISMATCH', 'field target format이 변경되었습니다.');
           }
           if (afterEvidence.adjacentContextSha256 !== beforeNonTarget) {
@@ -2098,6 +2275,7 @@ export class DocumentAgentController {
     const currentEvidence = collectFieldTargetEvidence(this.deps.wasm, entry.command.target);
     if (currentEvidence.textSha256 !== command.expectedAfterSha256
         || currentEvidence.textSha256 !== entry.applyReceipt.afterTextSha256
+        || currentEvidence.formatSha256 !== entry.afterEvidence.formatSha256
         || currentEvidence.adjacentContextSha256 !== entry.nonTargetManifestSha256) {
       throw new DocumentAgentError('COMMAND_NOT_LATEST', 'field apply 뒤 문서가 변경되어 되돌릴 수 없습니다.');
     }
@@ -2117,6 +2295,7 @@ export class DocumentAgentController {
             currentEvidence.text,
             entry.beforeText,
             entry.beforeEvidence,
+            'preserve',
           );
           revertedEvidence = collectFieldTargetEvidence(wasm, entry.command.target);
           if (revertedEvidence.textSha256 !== entry.beforeEvidence.textSha256
@@ -2330,7 +2509,10 @@ export class DocumentAgentController {
       if (state.documentEpoch !== receipt.documentEpoch
           || state.changeSeq !== receipt.afterChangeSeq
           || state.documentSha256 !== receipt.afterDocumentSha256) return false;
-      return collectFieldTargetEvidence(this.deps.wasm, receipt.target).textSha256 === expectedTextSha256;
+      const evidence = collectFieldTargetEvidence(this.deps.wasm, receipt.target);
+      return evidence.textSha256 === expectedTextSha256
+        && evidence.formatSha256 === receipt.formatSha256
+        && evidence.adjacentContextSha256 === receipt.adjacentContextSha256;
     } catch {
       return false;
     }

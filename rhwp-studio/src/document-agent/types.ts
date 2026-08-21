@@ -38,6 +38,27 @@ export type RhwpFieldTargetV1 =
   | RhwpTableCellRegionTargetV1
   | RhwpFormTextTargetV1;
 
+export type RhwpFieldRestoreFormatV1 =
+  | {
+      kind: 'table_cell_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+    }
+  | {
+      kind: 'table_cell_region';
+      paragraphs: Array<{
+        length: number;
+        charShapeIds: number[];
+        paraShapeId: number;
+      }>;
+    }
+  | {
+      kind: 'form_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+      styleId: number;
+    };
+
 export interface RhwpDocumentStateV1 {
   schemaVersion: 1;
   format: 'hwp' | 'hwpx';
@@ -103,6 +124,10 @@ export interface RhwpApplyFieldCommandV1 {
   expectedFormatSha256: string;
   expectedAdjacentContextSha256: string;
   replacement: string;
+  /** AI 본문, 현재 서식 유지, 서버가 봉인한 원래 서식 복원을 구분한다. */
+  replacementStyle?: 'actual-input' | 'preserve' | 'restore-exact';
+  replacementFormat?: RhwpFieldRestoreFormatV1;
+  expectedReplacementFormatSha256?: string;
 }
 
 /** 같은 Studio 세션에서 가장 최근에 성공한 field command만 exact revert한다. */

@@ -192,6 +192,18 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     expectedAfterDocumentSha256: 'e'.repeat(64),
     expectedAfterSha256: 'f'.repeat(64),
   };
+  const restoreField = {
+    ...apply,
+    commandId: 'field:undo',
+    target: fieldTarget,
+    replacementStyle: 'restore-exact' as const,
+    replacementFormat: {
+      kind: 'table_cell_text' as const,
+      charShapeIds: Array(Array.from(apply.replacement).length).fill(37),
+      paraShapeId: 9,
+    },
+    expectedReplacementFormatSha256: '9'.repeat(64),
+  };
   const handlers = {
     getDocumentState: async () => { calls.push({ method: 'state' }); return { ok: true }; },
     getSelectionContext: async () => { calls.push({ method: 'selection' }); return { ok: true }; },
@@ -214,6 +226,7 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
   await routeEmbedRequest('applyFieldCommand', { command: { ...apply, target: fieldTarget } }, handlers);
   await routeEmbedRequest('focusFieldTarget', { target: formFieldTarget }, handlers);
   await routeEmbedRequest('applyFieldCommand', { command: { ...apply, target: formFieldTarget } }, handlers);
+  await routeEmbedRequest('applyFieldCommand', { command: restoreField }, handlers);
   await routeEmbedRequest('revertFieldCommand', { command: revert }, handlers);
   assert.deepEqual(calls, [
     { method: 'state' },
@@ -226,6 +239,7 @@ test('embed router는 document-agent v1 command와 target을 strict DTO로만 �
     { method: 'apply-field', value: { ...apply, target: fieldTarget } },
     { method: 'focus-field', value: formFieldTarget },
     { method: 'apply-field', value: { ...apply, target: formFieldTarget } },
+    { method: 'apply-field', value: restoreField },
     { method: 'revert-field', value: revert },
   ]);
 

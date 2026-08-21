@@ -44,6 +44,15 @@ class FakeWasm implements DocumentAgentWasm {
   ];
   formFields: RhwpFormFieldEntry[] = [];
   replacementPageCount: number | null = null;
+  charShapeProperties = new Map<number, { textColor: string; italic: boolean }>([
+    [1, { textColor: '#000000', italic: false }],
+    [4, { textColor: '#000000', italic: false }],
+    [7, { textColor: '#000000', italic: false }],
+    [9, { textColor: '#000000', italic: false }],
+    [37, { textColor: '#0000ff', italic: true }],
+    [40, { textColor: '#000000', italic: false }],
+  ]);
+  nextCharShapeId = 100;
 
   getSourceFormat() { return this.sourceFormat; }
   getSectionCount() { return this.paragraphs.length; }
@@ -61,7 +70,8 @@ class FakeWasm implements DocumentAgentWasm {
   }
   getCharPropertiesAt(section: number, paragraphIndex: number, offset: number) {
     const para = this.paragraphs[section][paragraphIndex];
-    return { charShapeId: para.charShapeIds[Math.min(offset, para.charShapeIds.length - 1)] ?? 1 };
+    const charShapeId = para.charShapeIds[Math.min(offset, para.charShapeIds.length - 1)] ?? 1;
+    return { charShapeId, ...this.charShapeProperties.get(charShapeId) };
   }
   getParaPropertiesAt(section: number, paragraphIndex: number) {
     return { paraShapeId: this.paragraphs[section][paragraphIndex].paraShapeId };
@@ -130,7 +140,8 @@ class FakeWasm implements DocumentAgentWasm {
   }
   getCellCharPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
     const paragraph = this.cells[cellIndex][cellPara];
-    return { charShapeId: paragraph.charShapeIds[Math.min(offset, paragraph.charShapeIds.length - 1)] ?? 4 };
+    const charShapeId = paragraph.charShapeIds[Math.min(offset, paragraph.charShapeIds.length - 1)] ?? 4;
+    return { charShapeId, ...this.charShapeProperties.get(charShapeId) };
   }
   getCellParaPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number) {
     return { paraShapeId: this.cells[cellIndex][cellPara].paraShapeId };
@@ -151,6 +162,22 @@ class FakeWasm implements DocumentAgentWasm {
   setCharShapeId(section: number, paragraphIndex: number, start: number, end: number, id: number) {
     const para = this.paragraphs[section][paragraphIndex];
     for (let index = start; index < end; index += 1) para.charShapeIds[index] = id;
+    return '{}';
+  }
+  applyCharFormat(section: number, paragraphIndex: number, start: number, end: number, propsJson: string) {
+    const para = this.paragraphs[section][paragraphIndex];
+    const patch = JSON.parse(propsJson) as Partial<{ textColor: string; italic: boolean }>;
+    for (let index = start; index < end; index += 1) {
+      const beforeId = para.charShapeIds[index] ?? 1;
+      const nextId = this.nextCharShapeId++;
+      this.charShapeProperties.set(nextId, {
+        textColor: '#000000',
+        italic: false,
+        ...this.charShapeProperties.get(beforeId),
+        ...patch,
+      });
+      para.charShapeIds[index] = nextId;
+    }
     return '{}';
   }
   setParaShapeId(section: number, paragraphIndex: number, id: number) {
@@ -175,6 +202,22 @@ class FakeWasm implements DocumentAgentWasm {
   setCharShapeIdInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, start: number, end: number, id: number) {
     const paragraph = this.cells[cellIndex][cellPara];
     for (let index = start; index < end; index += 1) paragraph.charShapeIds[index] = id;
+    return '{}';
+  }
+  applyCharFormatInCell(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, start: number, end: number, propsJson: string) {
+    const paragraph = this.cells[cellIndex][cellPara];
+    const patch = JSON.parse(propsJson) as Partial<{ textColor: string; italic: boolean }>;
+    for (let index = start; index < end; index += 1) {
+      const beforeId = paragraph.charShapeIds[index] ?? 4;
+      const nextId = this.nextCharShapeId++;
+      this.charShapeProperties.set(nextId, {
+        textColor: '#000000',
+        italic: false,
+        ...this.charShapeProperties.get(beforeId),
+        ...patch,
+      });
+      paragraph.charShapeIds[index] = nextId;
+    }
     return '{}';
   }
   setCellParaShapeId(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, id: number) {
@@ -219,12 +262,14 @@ class FakeWasm implements DocumentAgentWasm {
         paragraphs: this.paragraphs,
         cells: this.cells,
         formFields: this.formFields,
+        charShapeProperties: [...this.charShapeProperties],
         pageCount: this.pageCount,
       })),
       exportHwpx: () => encoder.encode(JSON.stringify({
         paragraphs: this.paragraphs,
         cells: this.cells,
         formFields: this.formFields,
+        charShapeProperties: [...this.charShapeProperties],
         pageCount: this.pageCount,
       })),
     };
@@ -236,6 +281,8 @@ class FakeWasm implements DocumentAgentWasm {
       paragraphs: structuredClone(this.paragraphs),
       cells: structuredClone(this.cells),
       formFields: structuredClone(this.formFields),
+      charShapeProperties: structuredClone(this.charShapeProperties),
+      nextCharShapeId: this.nextCharShapeId,
     };
   }
   restoreState(snapshot: ReturnType<FakeWasm['cloneState']>) {
@@ -243,6 +290,8 @@ class FakeWasm implements DocumentAgentWasm {
     this.paragraphs = structuredClone(snapshot.paragraphs);
     this.cells = structuredClone(snapshot.cells);
     this.formFields = structuredClone(snapshot.formFields);
+    this.charShapeProperties = structuredClone(snapshot.charShapeProperties);
+    this.nextCharShapeId = snapshot.nextCharShapeId;
   }
 }
 
@@ -422,6 +471,7 @@ function fieldCommand(
     expectedFormatSha256: evidence.formatSha256,
     expectedAdjacentContextSha256: evidence.adjacentContextSha256,
     replacement,
+    replacementStyle: 'actual-input',
   };
 }
 
@@ -450,6 +500,7 @@ function fieldRegionCommand(
     expectedFormatSha256: evidence.formatSha256,
     expectedAdjacentContextSha256: evidence.adjacentContextSha256,
     replacement,
+    replacementStyle: 'actual-input',
   };
 }
 
@@ -495,6 +546,7 @@ function formFieldCommand(
     expectedFormatSha256: evidence.formatSha256,
     expectedAdjacentContextSha256: evidence.adjacentContextSha256,
     replacement,
+    replacementStyle: 'actual-input',
   };
 }
 
@@ -554,7 +606,7 @@ test('table_cell_region apply/revert는 셀 전체 장문 문단을 변경하고
   assert.equal(input.transactions, 2);
 });
 
-test('table_cell_region은 안내문 혼합 서식을 canonical 본문으로 적용하고 revert에서 exact 복원한다', async () => {
+test('table_cell_region은 안내문을 제거하고 AI 본문을 검은색 실제 입력 서식으로 적용한 뒤 exact 복원한다', async () => {
   const { controller, wasm, input } = harness();
   const first = cellParagraph('※ 안내 본문');
   first.charShapeIds = [37, 37, ...Array(Array.from(first.text).length - 2).fill(40)];
@@ -565,13 +617,22 @@ test('table_cell_region은 안내문 혼합 서식을 canonical 본문으로 적
   wasm.cells[1] = [first, second];
   const before = structuredClone(wasm.cells);
   const command = fieldRegionCommand(controller, wasm, '사용자 사실을 바탕으로 작성한 첫 문단\n검증 가능한 두 번째 문단');
+  const beforeEvidence = collectFieldTargetEvidence(wasm, command.target);
 
   const applied = await controller.applyFieldCommand(command);
   assert.deepEqual(wasm.cells[1].map(paragraph => paragraph.text), [
     '사용자 사실을 바탕으로 작성한 첫 문단',
     '검증 가능한 두 번째 문단',
   ]);
-  assert.ok(wasm.cells[1].every(paragraph => paragraph.charShapeIds.every(id => id === 37 || id === 40)));
+  assert.ok(!wasm.cells[1].some(paragraph => paragraph.text.includes('안내')));
+  for (let paragraph = 0; paragraph < wasm.cells[1].length; paragraph += 1) {
+    for (let offset = 0; offset < Array.from(wasm.cells[1][paragraph].text).length; offset += 1) {
+      const properties = wasm.getCellCharPropertiesAt(0, 1, 0, 1, paragraph, offset);
+      assert.equal(properties.textColor, '#000000');
+      assert.equal(properties.italic, false);
+    }
+  }
+  assert.notEqual(applied.formatSha256, beforeEvidence.formatSha256);
   assert.equal(input.transactions, 1);
 
   await controller.revertFieldCommand({
@@ -584,6 +645,55 @@ test('table_cell_region은 안내문 혼합 서식을 canonical 본문으로 적
   });
   assert.deepEqual(wasm.cells, before);
   assert.equal(input.transactions, 2);
+});
+
+test('새 Studio 세션도 봉인된 안내문 서식을 restore-exact로 복원한다', async () => {
+  const { controller, wasm } = harness();
+  const guide = cellParagraph('※ 파란색 안내문');
+  guide.charShapeIds = Array(Array.from(guide.text).length).fill(37);
+  guide.paraShapeId = 35;
+  wasm.cells[1] = [guide];
+  const before = structuredClone(wasm.cells[1]);
+  const apply = fieldRegionCommand(controller, wasm, '검은색으로 적용할 AI 본문');
+  const beforeEvidence = collectFieldTargetEvidence(wasm, apply.target);
+
+  await controller.applyFieldCommand(apply);
+  assert.equal(wasm.getCellCharPropertiesAt(0, 1, 0, 1, 0, 0).textColor, '#000000');
+
+  const reloadedEventBus = new EventBus();
+  const reloadedInput = new FakeInput(wasm, reloadedEventBus);
+  const reloaded = new DocumentAgentController({
+    wasm,
+    input: reloadedInput,
+    eventBus: reloadedEventBus,
+    isDirty: () => true,
+    render: async () => {},
+  });
+  const state = reloaded.getDocumentState();
+  const currentEvidence = collectFieldTargetEvidence(wasm, apply.target);
+  await reloaded.applyFieldCommand({
+    schemaVersion: 1,
+    commandId: 'field-region-cmd-1:undo',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target: apply.target,
+    expectedBeforeSha256: currentEvidence.textSha256,
+    expectedFormatSha256: currentEvidence.formatSha256,
+    expectedAdjacentContextSha256: currentEvidence.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({
+        length: Array.from(paragraph.text).length,
+        charShapeIds: [...paragraph.charShapeIds],
+        paraShapeId: paragraph.paraShapeId,
+      })),
+    },
+    expectedReplacementFormatSha256: beforeEvidence.formatSha256,
+  });
+  assert.deepEqual(wasm.cells[1], before);
 });
 
 test('form_text apply/revert는 exact 누름틀 값만 변경하고 구조와 문맥을 복원한다', async () => {
