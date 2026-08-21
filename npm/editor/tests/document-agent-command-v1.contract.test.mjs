@@ -111,7 +111,13 @@ function revertCommand() {
 }
 
 function applyFieldCommand() {
-  return { ...applyCommand(), commandId: 'field-001', target: fieldTarget(), replacement: '주식회사 노튼' };
+  return {
+    ...applyCommand(),
+    commandId: 'field-001',
+    target: fieldTarget(),
+    replacement: '주식회사 노튼',
+    replacementStyle: 'actual-input',
+  };
 }
 
 function applyFormFieldCommand() {

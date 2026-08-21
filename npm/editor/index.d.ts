@@ -302,7 +302,32 @@ export interface RhwpApplyFieldCommandV1 {
   expectedFormatSha256: string;
   expectedAdjacentContextSha256: string;
   replacement: string;
+  /** AI 본문, 현재 서식 유지, 서버가 봉인한 원래 서식 복원을 구분한다. */
+  replacementStyle?: 'actual-input' | 'preserve' | 'restore-exact';
+  replacementFormat?: RhwpFieldRestoreFormatV1;
+  expectedReplacementFormatSha256?: string;
 }
+
+export type RhwpFieldRestoreFormatV1 =
+  | {
+      kind: 'table_cell_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+    }
+  | {
+      kind: 'table_cell_region';
+      paragraphs: Array<{
+        length: number;
+        charShapeIds: number[];
+        paraShapeId: number;
+      }>;
+    }
+  | {
+      kind: 'form_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+      styleId: number;
+    };
 
 export type RhwpRevertFieldCommandV1 = RhwpRevertTextCommandV1;
 

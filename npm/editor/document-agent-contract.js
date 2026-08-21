@@ -153,16 +153,61 @@ export function validateApplyFieldCommand(value) {
       || (command.target.kind !== 'table_cell_region' && /\n/u.test(command.replacement))) {
     throw contractError('INVALID_COMMAND', 'field command replacement must not contain line breaks');
   }
+  if (command.replacementStyle !== undefined
+      && command.replacementStyle !== 'actual-input'
+      && command.replacementStyle !== 'preserve'
+      && command.replacementStyle !== 'restore-exact') {
+    throw contractError('INVALID_COMMAND', 'command.replacementStyle is invalid');
+  }
+  if (command.replacementStyle === 'restore-exact') {
+    sha256(
+      command.expectedReplacementFormatSha256,
+      'command.expectedReplacementFormatSha256',
+      'INVALID_COMMAND',
+    );
+    const replacementFormat = validateFieldRestoreFormat(
+      command.replacementFormat,
+      command.target,
+      'INVALID_COMMAND',
+    );
+    const lengths = command.target.kind === 'table_cell_region'
+      ? command.replacement.split('\n').map((part) => Array.from(part).length)
+      : [Array.from(command.replacement).length];
+    const formats = replacementFormat.kind === 'table_cell_region'
+      ? replacementFormat.paragraphs
+      : [{ length: lengths[0], charShapeIds: replacementFormat.charShapeIds }];
+    if (formats.length !== lengths.length || formats.some((format, index) =>
+      format.length !== lengths[index]
+      || format.charShapeIds.length !== Math.max(lengths[index], 1))) {
+      throw contractError('INVALID_COMMAND', 'command.replacementFormat length must match replacement');
+    }
+    return { ...command, replacementFormat };
+  }
+  if (command.replacementFormat !== undefined
+      || command.expectedReplacementFormatSha256 !== undefined) {
+    throw contractError(
+      'INVALID_COMMAND',
+      'exact replacement format is only valid for restore-exact commands',
+    );
+  }
   return command;
 }
 
 function validateApplyTextCommandShape(value, validateTarget) {
   const code = 'INVALID_COMMAND';
   const command = record(value, 'command', code);
+  const optionalKeys = [
+    ...(command.replacementStyle === undefined ? [] : ['replacementStyle']),
+    ...(command.replacementFormat === undefined ? [] : ['replacementFormat']),
+    ...(command.expectedReplacementFormatSha256 === undefined
+      ? []
+      : ['expectedReplacementFormatSha256']),
+  ];
   exactKeys(command, [
     'schemaVersion', 'commandId', 'expectedDocumentEpoch', 'expectedChangeSeq',
     'expectedDocumentSha256', 'target', 'expectedBeforeSha256',
     'expectedFormatSha256', 'expectedAdjacentContextSha256', 'replacement',
+    ...optionalKeys,
   ], 'command', code);
   if (command.schemaVersion !== 1) throw contractError(code, 'command.schemaVersion must be 1');
   if (typeof command.commandId !== 'string'
@@ -184,6 +229,86 @@ function validateApplyTextCommandShape(value, validateTarget) {
     throw contractError(code, 'command.replacement must not contain control characters');
   }
   return command;
+}
+
+function validateFieldRestoreFormat(value, target, code) {
+  const format = record(value, 'command.replacementFormat', code);
+  if (format.kind !== target.kind) {
+    throw contractError(code, 'command.replacementFormat kind must match target kind');
+  }
+  if (format.kind === 'table_cell_region') {
+    exactKeys(format, ['kind', 'paragraphs'], 'command.replacementFormat', code);
+    if (!Array.isArray(format.paragraphs)
+        || format.paragraphs.length < 1
+        || format.paragraphs.length > 100) {
+      throw contractError(code, 'command.replacementFormat.paragraphs is invalid');
+    }
+    return {
+      kind: 'table_cell_region',
+      paragraphs: format.paragraphs.map((value, index) => {
+        const paragraph = record(
+          value,
+          `command.replacementFormat.paragraphs[${index}]`,
+          code,
+        );
+        exactKeys(
+          paragraph,
+          ['length', 'charShapeIds', 'paraShapeId'],
+          `command.replacementFormat.paragraphs[${index}]`,
+          code,
+        );
+        safeInteger(
+          paragraph.length,
+          `command.replacementFormat.paragraphs[${index}].length`,
+          0,
+          code,
+        );
+        safeInteger(
+          paragraph.paraShapeId,
+          `command.replacementFormat.paragraphs[${index}].paraShapeId`,
+          0,
+          code,
+        );
+        return {
+          length: paragraph.length,
+          charShapeIds: validateRestoreCharShapeIds(
+            paragraph.charShapeIds,
+            `command.replacementFormat.paragraphs[${index}].charShapeIds`,
+            code,
+          ),
+          paraShapeId: paragraph.paraShapeId,
+        };
+      }),
+    };
+  }
+  const allowedKeys = format.kind === 'form_text'
+    ? ['kind', 'charShapeIds', 'paraShapeId', 'styleId']
+    : ['kind', 'charShapeIds', 'paraShapeId'];
+  exactKeys(format, allowedKeys, 'command.replacementFormat', code);
+  safeInteger(format.paraShapeId, 'command.replacementFormat.paraShapeId', 0, code);
+  const charShapeIds = validateRestoreCharShapeIds(
+    format.charShapeIds,
+    'command.replacementFormat.charShapeIds',
+    code,
+  );
+  if (format.kind === 'form_text') {
+    safeInteger(format.styleId, 'command.replacementFormat.styleId', 0, code);
+    return {
+      kind: 'form_text',
+      charShapeIds,
+      paraShapeId: format.paraShapeId,
+      styleId: format.styleId,
+    };
+  }
+  return { kind: 'table_cell_text', charShapeIds, paraShapeId: format.paraShapeId };
+}
+
+function validateRestoreCharShapeIds(value, label, code) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4000) {
+    throw contractError(code, `${label} is invalid`);
+  }
+  value.forEach((id, index) => safeInteger(id, `${label}[${index}]`, 0, code));
+  return value;
 }
 
 export function validateRevertTextCommand(value) {
