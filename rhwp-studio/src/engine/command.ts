@@ -2083,6 +2083,19 @@ export class SnapshotCommand implements EditCommand {
     return this.noOp;
   }
 
+  /**
+   * 최초 실행 전 문서 스냅숏 id. document-agent 같은 세션 정확 되돌리기가 이 명령이
+   * undo top일 때만 읽는다. discard 뒤에는 null.
+   */
+  beforeSnapshotId(): number | null {
+    return this.beforeId;
+  }
+
+  /** 최초 실행 전 커서 위치(복사본). */
+  cursorBeforePosition(): DocumentPosition {
+    return { ...this.cursorBefore };
+  }
+
   undo(wasm: WasmBridge): DocumentPosition {
     if (this.beforeId !== null) {
       wasm.restoreSnapshot(this.beforeId);

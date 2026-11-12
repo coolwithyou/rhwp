@@ -1046,3 +1046,257 @@ test('field selection과 focus는 본문 누름틀의 exact fieldId를 노출하
   assert.equal(input.transactions, 0);
   assert.equal(events.length, 0);
 });
+
+// ── 5차: 같은 세션 field revert는 apply snapshot 명령의 before 스냅숏으로 정확히 복원한다 ──
+
+/**
+ * core 스냅숏과 "영역 교체가 되살리지 못하는 문단 끝 빈 run"을 흉내 내는 fake.
+ * trailingRun은 export bytes에만 나타나고 target evidence(text/format/context)에는 없다.
+ * 셀 텍스트를 교체하면 원래 값('11pt')을 잃는다 — 실제 core에서 끝 빈 run이 바뀌는 현상과 같은 모양.
+ */
+class SnapshotWasm extends FakeWasm {
+  trailingRun = '11pt';
+  snapshots = new Map<number, ReturnType<SnapshotWasm['cloneState']>>();
+  nextSnapshotId = 0;
+  restoreCalls: number[] = [];
+  cellTextWrites = 0;
+
+  override cloneState() {
+    return { ...super.cloneState(), trailingRun: this.trailingRun };
+  }
+  override restoreState(snapshot: ReturnType<FakeWasm['cloneState']> & { trailingRun?: string }) {
+    super.restoreState(snapshot);
+    if (snapshot.trailingRun !== undefined) this.trailingRun = snapshot.trailingRun;
+  }
+  saveSnapshot() {
+    const id = this.nextSnapshotId++;
+    this.snapshots.set(id, this.cloneState());
+    return id;
+  }
+  restoreSnapshot(id: number) {
+    const snapshot = this.snapshots.get(id);
+    if (!snapshot) throw new Error(`snapshot ${id} 없음`);
+    this.restoreCalls.push(id);
+    this.restoreState(structuredClone(snapshot));
+  }
+  discardSnapshot(id: number) { this.snapshots.delete(id); }
+  override replaceTextInCellDeferredPagination(...args: Parameters<FakeWasm['replaceTextInCellDeferredPagination']>) {
+    this.cellTextWrites += 1;
+    this.trailingRun = '10pt';
+    return super.replaceTextInCellDeferredPagination(...args);
+  }
+  override borrowDocumentHandle() {
+    const base = super.borrowDocumentHandle();
+    const tail = () => encoder.encode(`|trailing:${this.trailingRun}`);
+    const join = (head: Uint8Array) => {
+      const bytes = new Uint8Array(head.length + tail().length);
+      bytes.set(head);
+      bytes.set(tail(), head.length);
+      return bytes;
+    };
+    return { exportHwp: () => join(base.exportHwp()), exportHwpx: () => join(base.exportHwpx()) };
+  }
+}
+
+/** InputHandler + CommandHistory를 흉내 낸다: 성공한 snapshot 실행만 undo stack에 before id와 함께 쌓는다. */
+class SnapshotHistoryInput extends FakeInput {
+  undoStack: Array<{ type: string; beforeId: number | null; cursorBefore: ReturnType<FakeInput['getCursorPosition']> }> = [];
+  hookEnabled = true;
+  private snapWasm: SnapshotWasm;
+
+  constructor(wasm: SnapshotWasm, eventBus: EventBus) {
+    super(wasm, eventBus);
+    this.snapWasm = wasm;
+  }
+
+  override async executeDocumentAgentOperation(
+    desc: Parameters<DocumentAgentInput['executeDocumentAgentOperation']>[0],
+    render: () => Promise<void>,
+  ) {
+    const cursorBefore = this.getCursorPosition();
+    const beforeId = this.snapWasm.saveSnapshot();
+    const committedBefore = this.transactions;
+    try {
+      await super.executeDocumentAgentOperation(desc, render);
+    } catch (error) {
+      this.snapWasm.discardSnapshot(beforeId);
+      throw error;
+    }
+    if (this.transactions === committedBefore) {
+      this.snapWasm.discardSnapshot(beforeId);
+      return;
+    }
+    this.undoStack.push({ type: `snapshot:${desc.operationType}`, beforeId, cursorBefore });
+  }
+
+  documentAgentUndoSnapshot(operationType: string) {
+    if (!this.hookEnabled) return null;
+    const top = this.undoStack.at(-1);
+    if (!top || top.type !== `snapshot:${operationType}` || top.beforeId === null) return null;
+    return { snapshotId: top.beforeId, cursorBefore: { ...top.cursorBefore } };
+  }
+}
+
+function snapshotHarness(options: { render?: () => Promise<void> } = {}) {
+  const wasm = new SnapshotWasm();
+  const eventBus = new EventBus();
+  const input = new SnapshotHistoryInput(wasm, eventBus);
+  const events: unknown[] = [];
+  eventBus.on('document-agent-changed', (event) => events.push(event));
+  const controller = new DocumentAgentController({
+    wasm,
+    input,
+    eventBus,
+    isDirty: () => true,
+    render: options.render ?? (async () => {}),
+  });
+  wasm.cells[1] = [cellParagraph('기존 첫 문단'), cellParagraph('기존 둘째 문단')];
+  return { controller, wasm, input, events, eventBus };
+}
+
+function exportText(wasm: FakeWasm) {
+  return new TextDecoder().decode(wasm.exportHwp());
+}
+
+function revertOf(applied: Awaited<ReturnType<DocumentAgentController['applyFieldCommand']>>) {
+  return {
+    schemaVersion: 1 as const,
+    commandId: applied.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  };
+}
+
+test('같은 세션 field revert는 apply 스냅숏으로 문단 끝 run까지 apply 전 bytes로 복원한다', async () => {
+  const { controller, wasm, input, events } = snapshotHarness();
+  const beforeBytes = exportText(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  assert.equal(wasm.trailingRun, '10pt');
+  const applySnapshotId = input.undoStack.at(-1)!.beforeId;
+  const writesBeforeRevert = wasm.cellTextWrites;
+
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, [applySnapshotId]);
+  assert.equal(wasm.cellTextWrites, writesBeforeRevert, 'snapshot 경로는 영역 교체를 하지 않는다');
+  assert.equal(exportText(wasm), beforeBytes);
+  assert.equal(wasm.trailingRun, '11pt');
+  assert.equal(reverted.afterDocumentSha256, applied.beforeDocumentSha256);
+  assert.equal(reverted.afterTextSha256, applied.beforeTextSha256);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+  assert.equal(events.length, 2);
+  assert.equal(input.undoStack.at(-1)!.type, 'snapshot:field-agent:revert');
+  // receipt 형식은 v1 그대로다(host 호환).
+  assert.deepEqual(Object.keys(reverted).sort(), Object.keys(applied).sort());
+  assert.deepEqual(await controller.revertFieldCommand(revertOf(applied)), reverted, 'replay는 같은 receipt');
+});
+
+test('hook이 없는 이전 host는 기존 영역 교체로 되돌리고 끝 run 손실도 그대로다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  input.hookEnabled = false;
+  const beforeBytes = exportText(wasm);
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(wasm.trailingRun, '10pt');
+  assert.notEqual(exportText(wasm), beforeBytes);
+  assert.equal(reverted.afterTextSha256, applied.beforeTextSha256);
+  assert.equal(input.transactions, 2);
+});
+
+test('apply 스냅숏이 축출돼 hook이 null이면 영역 교체로 되돌린다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  input.undoStack.at(-1)!.beforeId = null; // history budget eviction → discard
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(input.transactions, 2);
+});
+
+test('core 스냅숏 복원이 실패하면 rollback 뒤 영역 교체로 한 번만 commit한다', async () => {
+  const { controller, wasm, input, events } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  wasm.snapshots.delete(input.undoStack.at(-1)!.beforeId!); // core가 무통보로 잃은 스냅숏
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+  assert.equal(events.length, 2);
+  assert.equal(input.undoStack.filter(entry => entry.type === 'snapshot:field-agent:revert').length, 1);
+});
+
+test('복원 bytes가 apply 전 문서 SHA와 다르면 스냅숏 결과를 버리고 영역 교체로 되돌린다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const applySnapshot = wasm.snapshots.get(input.undoStack.at(-1)!.beforeId!)!;
+  applySnapshot.trailingRun = '다른 문서';
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.equal(wasm.restoreCalls.length, 1);
+  assert.notEqual(wasm.trailingRun, '다른 문서', '불일치 스냅숏 상태는 commit되지 않는다');
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+});
+
+test('apply 뒤 다른 편집이 있으면 스냅숏 경로도 복원 없이 거부한다', async () => {
+  const { controller, wasm, input, eventBus } = snapshotHarness();
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  wasm.cells[0][0].text = '사용자 편집';
+  eventBus.emit('document-mutated', 'user-edit');
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string }).code === 'COMMAND_NOT_LATEST',
+  );
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.equal(input.transactions, 1);
+});
+
+test('다른 snapshot 명령이 undo top이면 apply 스냅숏을 쓰지 않는다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  // changeSeq를 바꾸지 않고 top만 바뀐 비정상 상태(방어 확인): hook은 null, 영역 교체로 간다.
+  input.undoStack.push({ type: 'snapshot:pasteInternal', beforeId: wasm.saveSnapshot(), cursorBefore: input.getCursorPosition() });
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+});
+
+test('반복 apply→revert도 매번 apply 전 bytes로 돌아간다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const beforeBytes = exportText(wasm);
+  for (let round = 0; round < 3; round += 1) {
+    const command = { ...fieldRegionCommand(controller, wasm, `새 첫 문단 ${round}\n새 둘째 문단`), commandId: `region-${round}` };
+    const applied = await controller.applyFieldCommand(command);
+    await controller.revertFieldCommand(revertOf(applied));
+    assert.equal(exportText(wasm), beforeBytes, `round ${round}`);
+  }
+  assert.equal(wasm.restoreCalls.length, 3);
+  assert.equal(input.transactions, 6);
+});
+
+test('스냅숏 revert의 strict render 실패는 apply 상태로 복구하고 재시도할 수 있다', async () => {
+  let failRender = false;
+  const { controller, wasm, input } = snapshotHarness({
+    render: async () => { if (failRender) throw new Error('renderer unavailable'); },
+  });
+  const beforeBytes = exportText(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const appliedBytes = exportText(wasm);
+  failRender = true;
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string; recovered?: boolean }).code === 'RENDER_FAILED',
+  );
+  assert.equal(exportText(wasm), appliedBytes);
+  assert.equal(input.transactions, 1);
+  failRender = false;
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.equal(exportText(wasm), beforeBytes);
+});

@@ -203,6 +203,8 @@ export interface DocumentAgentWasm {
   beginDeferredPagination?(): void;
   flushDeferredPagination?(): void;
   cancelDeferredPagination?(): void;
+  /** 같은 세션 정확 되돌리기용. 없으면 기존 영역 교체로 되돌린다. */
+  restoreSnapshot?(id: number): void;
 }
 
 export interface DocumentAgentInput {
@@ -229,6 +231,13 @@ export interface DocumentAgentInput {
     cellParagraph: number,
   ): { focused: boolean; page: number };
   focusFormText(section: number, paragraph: number, fieldId: number): { focused: boolean; page: number };
+  /**
+   * 선택: undo top이 지정한 document-agent snapshot 명령일 때 그 before 스냅숏 id와 실행 전
+   * 커서. 이 hook이 없는 host는 field revert를 기존 영역 교체로 수행한다.
+   */
+  documentAgentUndoSnapshot?(
+    operationType: string,
+  ): { snapshotId: number; cursorBefore: DocumentPosition } | null;
 }
 
 export interface RhwpFormFieldEntry {
@@ -288,6 +297,18 @@ interface FieldAgentJournalEntry {
   status: 'applied' | 'reverted';
   revertBindingSha256?: string;
   revertReceipt?: RhwpFieldCommandReceiptV1;
+  /** apply 직후 undo top에 있던 apply snapshot 명령의 before 스냅숏 id. */
+  applySnapshotId: number | null;
+  revertPath?: 'snapshot' | 'replace';
+}
+
+/** 같은 세션 스냅숏 되돌리기를 쓸 수 없음. 문서는 rollback됐고 영역 교체로 넘어간다. */
+class SnapshotRevertUnavailable extends Error {
+  constructor(cause: unknown) {
+    super(typeof cause === 'string' ? cause : 'apply 스냅숏을 복원할 수 없습니다.');
+    this.name = 'SnapshotRevertUnavailable';
+    if (typeof cause !== 'string') (this as { cause?: unknown }).cause = cause;
+  }
 }
 
 interface DocumentAgentControllerDeps {
@@ -2230,6 +2251,7 @@ export class DocumentAgentController {
       afterEvidence,
       nonTargetManifestSha256: beforeNonTarget,
       status: 'applied',
+      applySnapshotId: this.deps.input.documentAgentUndoSnapshot?.('field-agent:apply')?.snapshotId ?? null,
     };
     this.fieldJournal.set(command.commandId, entry);
     this.latestField = entry;
@@ -2283,20 +2305,42 @@ export class DocumentAgentController {
     let revertedEvidence!: TargetEvidence;
     let afterDocumentSha256 = '';
     const beforeSeq = this.changeSeq;
-    try {
-      await this.deps.input.executeDocumentAgentOperation({
+    // 같은 세션에서 apply snapshot 명령이 아직 undo top이면 그 before 스냅숏으로 정확히
+    // 되돌린다. 영역 교체는 문단 끝 빈 run 글자 모양을 되살리지 못하기 때문이다(5차).
+    // 복원 결과가 apply 전 문서 bytes와 다르거나 스냅숏을 쓸 수 없으면 아무것도 commit하지
+    // 않고 기존 영역 교체로 넘어간다. 아래 before evidence · 페이지 수 검사는 두 경로 공통이다.
+    const undoSnapshot = entry.applySnapshotId === null
+      ? null
+      : this.deps.input.documentAgentUndoSnapshot?.('field-agent:apply') ?? null;
+    const snapshotUsable = undoSnapshot !== null
+      && undoSnapshot.snapshotId === entry.applySnapshotId
+      && typeof this.deps.wasm.restoreSnapshot === 'function';
+    const runRevert = (path: 'snapshot' | 'replace') => this.deps.input.executeDocumentAgentOperation({
         kind: 'snapshot',
         operationType: 'field-agent:revert',
         operation: (wasm) => {
           this.assertRuntimeFence(command.expectedDocumentEpoch, beforeSeq);
-          const position = replaceExactFieldText(
-            wasm,
-            entry.command.target,
-            currentEvidence.text,
-            entry.beforeText,
-            entry.beforeEvidence,
-            'preserve',
-          );
+          let position: DocumentPosition | null;
+          if (path === 'snapshot') {
+            try {
+              wasm.restoreSnapshot!(undoSnapshot!.snapshotId);
+            } catch (error) {
+              throw new SnapshotRevertUnavailable(error);
+            }
+            if (exportDocumentSha256(wasm, state.format) !== entry.applyReceipt.beforeDocumentSha256) {
+              throw new SnapshotRevertUnavailable('apply 전 문서 SHA와 다릅니다.');
+            }
+            position = undoSnapshot!.cursorBefore;
+          } else {
+            position = replaceExactFieldText(
+              wasm,
+              entry.command.target,
+              currentEvidence.text,
+              entry.beforeText,
+              entry.beforeEvidence,
+              'preserve',
+            );
+          }
           revertedEvidence = collectFieldTargetEvidence(wasm, entry.command.target);
           if (revertedEvidence.textSha256 !== entry.beforeEvidence.textSha256
               || revertedEvidence.formatSha256 !== entry.beforeEvidence.formatSha256
@@ -2321,6 +2365,16 @@ export class DocumentAgentController {
         await this.deps.render();
         this.assertWithinBudget(startedAt);
       });
+    let revertPath: 'snapshot' | 'replace' = snapshotUsable ? 'snapshot' : 'replace';
+    try {
+      try {
+        await runRevert(revertPath);
+      } catch (error) {
+        // snapshot 시도는 SnapshotCommand가 원자적으로 rollback했고 commit 통지도 없었다.
+        if (!(error instanceof SnapshotRevertUnavailable) || this.changeSeq !== beforeSeq) throw error;
+        revertPath = 'replace';
+        await runRevert(revertPath);
+      }
     } catch (error) {
       throw this.normalizeExecutionError(error);
     }
@@ -2349,6 +2403,7 @@ export class DocumentAgentController {
     entry.status = 'reverted';
     entry.revertBindingSha256 = binding;
     entry.revertReceipt = receipt;
+    entry.revertPath = revertPath;
     this.emitDocumentAgentChanged({
       schemaVersion: 1,
       reason: 'field_agent_revert',
