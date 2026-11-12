@@ -320,6 +320,8 @@ export type RhwpFieldRestoreFormatV1 =
         length: number;
         charShapeIds: number[];
         paraShapeId: number;
+        /** 선택: 문단 끝 글자 모양. Studio가 `field-end-char-shape-v1`을 광고할 때만 보낸다. */
+        endCharShapeId?: number;
       }>;
     }
   | {
@@ -426,6 +428,8 @@ export declare class RhwpEditor {
   focusFieldTarget(target: RhwpFieldTargetV1): Promise<{ focused: boolean; page: number }>;
   /** exact table cell field를 한 트랜잭션으로 교체 */
   applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
+  /** restore-exact 영역 문단의 endCharShapeId를 Studio가 받는지(`field-end-char-shape-v1`) */
+  supportsFieldEndCharShape(): boolean;
   /** 가장 최근 exact field command를 한 트랜잭션으로 되돌림 */
   revertFieldCommand(command: RhwpRevertFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
   /** agent apply/revert가 commit된 뒤 strict v1 변경 이벤트 구독 */

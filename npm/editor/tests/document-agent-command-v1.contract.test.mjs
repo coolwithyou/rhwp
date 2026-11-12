@@ -455,3 +455,49 @@ test('field selection 이벤트는 같은 revision의 서로 다른 셀 이동�
     (error) => error.code === 'CAPABILITY_UNSUPPORTED',
   );
 });
+
+// 5차: restore-exact 영역 문단의 선택 필드 endCharShapeId(문단 끝 글자 모양)
+function restoreRegionCommand(paragraphExtra = {}) {
+  return {
+    ...applyFieldCommand(),
+    commandId: 'field-region-restore-001',
+    target: fieldRegionTarget(),
+    replacement: '첫문단\n둘',
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: [
+        { length: 3, charShapeIds: [70, 70, 70], paraShapeId: 28, ...paragraphExtra },
+        { length: 1, charShapeIds: [70], paraShapeId: 28 },
+      ],
+    },
+    expectedReplacementFormatSha256: 'e'.repeat(64),
+  };
+}
+
+test('endCharShapeId는 field-end-char-shape-v1을 광고한 Studio에만 보낸다', async () => {
+  const result = { ...fieldReceipt('apply'), commandId: 'field-region-restore-001', target: fieldRegionTarget() };
+  const withCapability = editorHarness({ applyFieldCommand: result }, [
+    'field-agent-command-v1',
+    'field-end-char-shape-v1',
+  ]);
+  assert.equal(withCapability.editor.supportsFieldEndCharShape(), true);
+  const command = restoreRegionCommand({ endCharShapeId: 21 });
+  assert.deepEqual(await withCapability.editor.applyFieldCommand(command), result);
+  assert.deepEqual(withCapability.requests, [{ method: 'applyFieldCommand', params: { command } }]);
+
+  const oldStudio = editorHarness({ applyFieldCommand: result }, ['field-agent-command-v1']);
+  assert.equal(oldStudio.editor.supportsFieldEndCharShape(), false);
+  await assert.rejects(oldStudio.editor.applyFieldCommand(command), (error) => error.code === 'CAPABILITY_UNSUPPORTED');
+  assert.deepEqual(oldStudio.requests, [], '이전 Studio에는 요청을 보내지 않는다');
+  // 필드를 빼면 이전 Studio에도 그대로 보낸다(끝 글자 모양은 부분 복원).
+  assert.deepEqual(await oldStudio.editor.applyFieldCommand(restoreRegionCommand()), result);
+});
+
+test('endCharShapeId는 0 이상 정수만 허용하고 다른 extra key는 계속 거부한다', async () => {
+  const { editor, requests } = editorHarness({}, ['field-agent-command-v1', 'field-end-char-shape-v1']);
+  for (const extra of [{ endCharShapeId: -1 }, { endCharShapeId: 1.5 }, { endCharShapeId: '21' }, { trailingRun: 21 }]) {
+    await assert.rejects(editor.applyFieldCommand(restoreRegionCommand(extra)), (error) => error.code === 'INVALID_COMMAND');
+  }
+  assert.deepEqual(requests, []);
+});

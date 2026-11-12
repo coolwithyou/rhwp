@@ -354,11 +354,24 @@ export class RhwpEditor {
   async applyFieldCommand(command) {
     assertCapability(this._transport, 'field-agent-command-v1');
     const validCommand = validateApplyFieldCommand(command);
+    if (validCommand.replacementFormat?.kind === 'table_cell_region'
+        && validCommand.replacementFormat.paragraphs.some(
+          (paragraph) => paragraph.endCharShapeId !== undefined,
+        )) {
+      // 이전 Studio는 이 필드를 계약 위반으로 거절한다. host는 supportsFieldEndCharShape()로
+      // 먼저 확인하고 지원하지 않으면 필드를 빼서 보낸다(끝 글자 모양은 부분 복원).
+      assertCapability(this._transport, 'field-end-char-shape-v1');
+    }
     const receipt = validateFieldCommandReceipt(await this._request('applyFieldCommand', {
       command: validCommand,
     }));
     this._rememberDocumentVersion(receipt.documentEpoch, receipt.afterChangeSeq);
     return receipt;
+  }
+
+  /** restore-exact 영역 문단의 endCharShapeId(문단 끝 글자 모양)를 Studio가 받는지. */
+  supportsFieldEndCharShape() {
+    return this._transport.supports('field-end-char-shape-v1');
   }
 
   /** 같은 Studio 세션의 가장 최근 exact field command를 되돌립니다. */

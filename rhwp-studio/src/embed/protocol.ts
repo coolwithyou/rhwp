@@ -19,6 +19,8 @@ export const EMBED_CAPABILITIES = [
   'field-agent-command-v1',
   'field-selection-events-v1',
   'document-change-events-v1',
+  // restore-exact 영역 문단의 선택 필드 endCharShapeId(문단 끝 글자 모양)를 받는다.
+  'field-end-char-shape-v1',
 ] as const;
 
 export interface EmbedConnectAttempt {

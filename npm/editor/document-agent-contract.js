@@ -253,10 +253,23 @@ function validateFieldRestoreFormat(value, target, code) {
         );
         exactKeys(
           paragraph,
-          ['length', 'charShapeIds', 'paraShapeId'],
+          [
+            'length',
+            'charShapeIds',
+            'paraShapeId',
+            ...(paragraph.endCharShapeId === undefined ? [] : ['endCharShapeId']),
+          ],
           `command.replacementFormat.paragraphs[${index}]`,
           code,
         );
+        if (paragraph.endCharShapeId !== undefined) {
+          safeInteger(
+            paragraph.endCharShapeId,
+            `command.replacementFormat.paragraphs[${index}].endCharShapeId`,
+            0,
+            code,
+          );
+        }
         safeInteger(
           paragraph.length,
           `command.replacementFormat.paragraphs[${index}].length`,
@@ -277,6 +290,9 @@ function validateFieldRestoreFormat(value, target, code) {
             code,
           ),
           paraShapeId: paragraph.paraShapeId,
+          ...(paragraph.endCharShapeId === undefined
+            ? {}
+            : { endCharShapeId: paragraph.endCharShapeId }),
         };
       }),
     };

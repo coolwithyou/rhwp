@@ -268,6 +268,11 @@ export interface TargetEvidence {
     length: number;
     charShapeIds: number[];
     paraShapeId: number;
+    /**
+     * 문단 끝 위치(offset = length)의 글자 모양. 글 뒤의 빈 run이나 문단 끝 표시의 모양이며
+     * 영역 교체가 잃는 정보다(5차). formatSha256(v1)에는 넣지 않는다. 읽을 수 없으면 없음.
+     */
+    endCharShapeId?: number;
   }>;
 }
 
@@ -546,6 +551,70 @@ function restoreRegionParagraphFormat(
     target.cellParagraph,
     exact?.paraShapeId ?? evidence.paraShapeId,
   );
+  if (exact?.endCharShapeId !== undefined) {
+    restoreCellParagraphEndCharShape(wasm, target, replacementLength, exact.endCharShapeId);
+  }
+}
+
+/** 문단 끝 위치(offset = length)의 글자 모양. core가 숫자를 주지 않으면 null. */
+function cellParagraphEndCharShapeId(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  length: number,
+): number | null {
+  const id = wasm.getCellCharPropertiesAt(
+    target.section,
+    target.parentPara,
+    target.controlIndex,
+    target.cellIndex,
+    target.cellParagraph,
+    length,
+  ).charShapeId;
+  return Number.isSafeInteger(id) && id! >= 0 ? id! : null;
+}
+
+const END_CHAR_SHAPE_SENTINEL = ' ';
+
+/**
+ * 문단 끝 글자 모양을 되살린다. core의 글자 모양 범위 지정은 글 길이 안쪽만 받으므로,
+ * 글 뒤에 보조 글자 하나를 넣어 그 글자에 원하는 모양을 준 뒤 지운다. 지운 자리의 모양이
+ * 문단 끝 모양으로 남는다(글 · 글자별 모양 · 문단 모양은 그대로). 보조 글자가 남으면 뒤의
+ * text 검사가 실패해 snapshot 트랜잭션 전체가 rollback된다.
+ *
+ * 보조 글자에는 먼저 지금 끝 모양을 줘서 글 뒤의 기존 끝 run과 합친 뒤 원하는 모양으로
+ * 덮어쓴다. 범위가 글 끝까지 닿으면 core가 그 뒤 run을 다시 만들지 않으므로 기존 끝 run이
+ * 사라진다. 원하는 끝 모양이 마지막 글자 모양과 같으면 앞 run에 합쳐져 끝 run이 없어진다.
+ */
+function restoreCellParagraphEndCharShape(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  length: number,
+  endCharShapeId: number,
+): void {
+  const currentEnd = cellParagraphEndCharShapeId(wasm, target, length);
+  if (currentEnd === endCharShapeId) return;
+  const at = [
+    target.section,
+    target.parentPara,
+    target.controlIndex,
+    target.cellIndex,
+    target.cellParagraph,
+    length,
+  ] as const;
+  const inserted = wasm.insertTextInCellDeferredPagination
+    ? wasm.insertTextInCellDeferredPagination(...at, END_CHAR_SHAPE_SENTINEL)
+    : wasm.replaceTextInCellDeferredPagination(...at, 0, END_CHAR_SHAPE_SENTINEL);
+  if (!inserted.ok) {
+    throw new DocumentAgentError('TRANSACTION_FAILED', '문단 끝 글자 모양을 복원하지 못했습니다.');
+  }
+  if (currentEnd !== null) wasm.setCharShapeIdInCell(...at, length + 1, currentEnd);
+  wasm.setCharShapeIdInCell(...at, length + 1, endCharShapeId);
+  const deleted = wasm.deleteTextInCellDeferredPagination
+    ? wasm.deleteTextInCellDeferredPagination(...at, 1)
+    : wasm.replaceTextInCellDeferredPagination(...at, 1, '');
+  if (!deleted.ok) {
+    throw new DocumentAgentError('TRANSACTION_FAILED', '문단 끝 글자 모양을 복원하지 못했습니다.');
+  }
 }
 
 function restoreExactCellCharShapeIds(
@@ -691,6 +760,7 @@ function exactRestoreEvidence(
         length: paragraph.length,
         charShapeIds: [...paragraph.charShapeIds],
         paraShapeId: paragraph.paraShapeId,
+        ...(paragraph.endCharShapeId === undefined ? {} : { endCharShapeId: paragraph.endCharShapeId }),
       })),
     };
   }
@@ -1376,10 +1446,12 @@ function collectTableCellRegionEvidence(
     ).paraShapeId, 'cell region paraShapeId');
     allCharShapeIds.push(...paragraphCharShapeIds);
     paraShapeIds.push(paragraphParaShapeId);
+    const endCharShapeId = cellParagraphEndCharShapeId(wasm, paragraphTarget, length);
     regionParagraphFormats.push({
       length,
       charShapeIds: paragraphCharShapeIds.slice(0, length),
       paraShapeId: paragraphParaShapeId,
+      ...(endCharShapeId === null ? {} : { endCharShapeId }),
     });
   }
   const charShapeId = dominantId(allCharShapeIds, 'cell region charShapeId');

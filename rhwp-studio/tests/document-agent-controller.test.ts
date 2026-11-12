@@ -1193,7 +1193,7 @@ test('같은 세션 field revert는 apply 스냅숏으로 문단 끝 run까지 a
   assert.deepEqual(await controller.revertFieldCommand(revertOf(applied)), reverted, 'replay는 같은 receipt');
 });
 
-test('hook이 없는 이전 host는 기존 영역 교체로 되돌리고 끝 run 손실도 그대로다', async () => {
+test('hook이 없는 이전 host는 영역 교체로 되돌리고 스냅숏에만 있는 상태는 되살리지 못한다', async () => {
   const { controller, wasm, input } = snapshotHarness();
   input.hookEnabled = false;
   const beforeBytes = exportText(wasm);
@@ -1299,4 +1299,175 @@ test('스냅숏 revert의 strict render 실패는 apply 상태로 복구하고 �
   failRender = false;
   await controller.revertFieldCommand(revertOf(applied));
   assert.equal(exportText(wasm), beforeBytes);
+});
+
+// ── 5차: 문단 끝 글자 모양(글 뒤 빈 run) 복원 ──
+
+type EndCellParagraph = CellParagraph & { endCharShapeId?: number };
+
+/**
+ * 실제 core처럼 문단 끝 위치(offset = 길이)의 글자 모양을 따로 갖는 fake.
+ * - 글이 빈 문단에 새 글을 넣으면 끝 모양이 driftEndId로 바뀐다(실제 core의 45 끝 run 재현)
+ * - 문단 끝까지 지우면 지운 첫 글자의 모양이 끝 모양으로 남는다
+ * - 끝에 넣은 글자는 끝 모양을 이어받는다
+ */
+class EndShapeWasm extends FakeWasm {
+  driftEndId = 45;
+  constructor() {
+    super();
+    this.charShapeProperties.set(21, { textColor: '#000000', italic: false });
+    this.charShapeProperties.set(45, { textColor: '#000000', italic: false });
+  }
+  private paragraphAt(cellIndex: number, cellPara: number) {
+    return this.cells[cellIndex][cellPara] as EndCellParagraph;
+  }
+  endOf(cellIndex: number, cellPara: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    return paragraph.endCharShapeId ?? paragraph.charShapeIds[Array.from(paragraph.text).length - 1] ?? paragraph.charShapeIds[0];
+  }
+  override getCellCharPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const charShapeId = offset >= Array.from(paragraph.text).length
+      ? this.endOf(cellIndex, cellPara)
+      : paragraph.charShapeIds[offset]!;
+    return { charShapeId, ...this.charShapeProperties.get(charShapeId) };
+  }
+  override replaceTextInCellDeferredPagination(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number, deleteCount: number, text: string) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const chars = Array.from(paragraph.text);
+    const length = chars.length;
+    const end = this.endOf(cellIndex, cellPara);
+    const ids = length === 0 ? [] : paragraph.charShapeIds.slice(0, length);
+    let nextEnd: number | undefined = paragraph.endCharShapeId;
+    if (deleteCount > 0 && offset + deleteCount === length) nextEnd = ids[offset];
+    const inserted = Array.from(text);
+    const insertedId = offset < length ? ids[offset]! : end;
+    chars.splice(offset, deleteCount, ...inserted);
+    ids.splice(offset, deleteCount, ...inserted.map(() => insertedId));
+    if (length - deleteCount === 0 && inserted.length > 0) nextEnd = this.driftEndId;
+    paragraph.text = chars.join('');
+    paragraph.charShapeIds = ids.length > 0 ? ids : [nextEnd ?? end];
+    if (nextEnd === undefined) delete paragraph.endCharShapeId;
+    else paragraph.endCharShapeId = nextEnd;
+    return { ok: true, charOffset: offset + inserted.length, paginationDeferred: true };
+  }
+}
+
+function endShapeHarness(withSnapshotHook = false) {
+  const wasm = new EndShapeWasm();
+  const eventBus = new EventBus();
+  const input = withSnapshotHook ? null : new FakeInput(wasm, eventBus);
+  const controller = new DocumentAgentController({
+    wasm,
+    input: input!,
+    eventBus,
+    isDirty: () => true,
+    render: async () => {},
+  });
+  const first = cellParagraph('기존 첫 문단');
+  (first as EndCellParagraph).endCharShapeId = 21; // 글 뒤 빈 run 11pt
+  const second = cellParagraph('기존 둘째');
+  wasm.cells[1] = [first, second];
+  return { controller, wasm, input: input!, eventBus };
+}
+
+function cellShape(wasm: EndShapeWasm) {
+  return wasm.cells[1].map((paragraph, index) => ({
+    text: paragraph.text,
+    ids: paragraph.charShapeIds.slice(0, Array.from(paragraph.text).length),
+    paraShapeId: paragraph.paraShapeId,
+    end: wasm.endOf(1, index),
+  }));
+}
+
+test('영역 evidence는 문단 끝 글자 모양을 담지만 v1 formatSha256은 바꾸지 않는다', () => {
+  const { wasm } = endShapeHarness();
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const evidence = collectFieldTargetEvidence(wasm, target);
+  assert.deepEqual(evidence.regionParagraphFormats?.map(format => format.endCharShapeId), [21, 7]);
+  (wasm.cells[1][0] as EndCellParagraph).endCharShapeId = 45;
+  assert.equal(collectFieldTargetEvidence(wasm, target).formatSha256, evidence.formatSha256);
+});
+
+test('스냅숏 없이 영역 교체로 되돌려도 문단 끝 글자 모양까지 반영 전과 같다', async () => {
+  const { controller, wasm, input } = endShapeHarness();
+  const before = cellShape(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단\n셋째'));
+  assert.notEqual(wasm.endOf(1, 0), 21);
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(cellShape(wasm), before);
+  assert.equal(input.transactions, 2);
+});
+
+test('끝 모양 정보가 없는 restore-exact(이전 host 계약)는 글 · 글자 모양만 맞고 끝 모양은 부분 복원이다', async () => {
+  const { controller, wasm } = endShapeHarness();
+  const before = cellShape(wasm);
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+  const state = controller.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand({
+    schemaVersion: 1,
+    commandId: 'restore-without-end',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({ length: paragraph.ids.length, charShapeIds: paragraph.ids, paraShapeId: paragraph.paraShapeId })),
+    },
+    expectedReplacementFormatSha256: beforeEvidence.formatSha256,
+  });
+  const after = cellShape(wasm);
+  assert.deepEqual(after.map(({ end: _end, ...rest }) => rest), before.map(({ end: _end, ...rest }) => rest));
+  assert.notEqual(after[0]!.end, 21, '끝 모양 정보가 없으면 되살리지 못한다(새 세션 제한)');
+});
+
+test('새 세션 restore-exact에 endCharShapeId가 있으면 문단 끝 글자 모양까지 되살린다', async () => {
+  const { controller, wasm } = endShapeHarness();
+  const before = cellShape(wasm);
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+  const reloadedBus = new EventBus();
+  const reloaded = new DocumentAgentController({
+    wasm,
+    input: new FakeInput(wasm, reloadedBus),
+    eventBus: reloadedBus,
+    isDirty: () => true,
+    render: async () => {},
+  });
+  const state = reloaded.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  await reloaded.applyFieldCommand({
+    schemaVersion: 1,
+    commandId: 'restore-with-end',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({
+        length: paragraph.ids.length,
+        charShapeIds: paragraph.ids,
+        paraShapeId: paragraph.paraShapeId,
+        endCharShapeId: paragraph.end,
+      })),
+    },
+    expectedReplacementFormatSha256: beforeEvidence.formatSha256,
+  });
+  assert.deepEqual(cellShape(wasm), before);
 });

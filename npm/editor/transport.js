@@ -13,6 +13,7 @@ const CAPABILITIES = [
   'field-agent-command-v1',
   'field-selection-events-v1',
   'document-change-events-v1',
+  'field-end-char-shape-v1',
 ];
 const LONG_RUNNING_METHODS = new Set([
   'loadFile', 'getFontDecisionTrace', 'exportHwp', 'exportHwpVerify', 'exportHwpx', 'exportHml',

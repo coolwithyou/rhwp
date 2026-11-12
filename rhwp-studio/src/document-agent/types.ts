@@ -50,6 +50,11 @@ export type RhwpFieldRestoreFormatV1 =
         length: number;
         charShapeIds: number[];
         paraShapeId: number;
+        /**
+         * 선택(`field-end-char-shape-v1`): 문단 끝 위치(offset = length)의 글자 모양.
+         * formatSha256(v1) 계산에는 들어가지 않는다.
+         */
+        endCharShapeId?: number;
       }>;
     }
   | {
