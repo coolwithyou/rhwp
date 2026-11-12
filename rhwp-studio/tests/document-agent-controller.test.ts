@@ -1351,6 +1351,42 @@ class EndShapeWasm extends FakeWasm {
     else paragraph.endCharShapeId = nextEnd;
     return { ok: true, charOffset: offset + inserted.length, paginationDeferred: true };
   }
+  /** 실제 core처럼 나눈 위치 뒤 run(끝 run 포함)은 새 문단으로 가고 앞 문단 끝 run은 사라진다. */
+  override splitParagraphInCell(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, charOffset: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const end = paragraph.endCharShapeId;
+    const result = super.splitParagraphInCell(section, parentPara, controlIndex, cellIndex, cellPara, charOffset);
+    delete (this.cells[cellIndex][cellPara] as EndCellParagraph).endCharShapeId;
+    if (end !== undefined) (this.cells[cellIndex][cellPara + 1] as EndCellParagraph).endCharShapeId = end;
+    return result;
+  }
+}
+
+/** 문단 끝 위치(offset ≥ 길이) 서식 지정을 무시하거나 잘못 적용하거나 끝 위치를 못 읽는 core. */
+class BrokenEndShapeWasm extends EndShapeWasm {
+  mode: 'ignore-tail' | 'wrong-id' | 'unreadable' = 'ignore-tail';
+  override setCharShapeIdInCell(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, start: number, end: number, id: number) {
+    const length = Array.from(this.cells[cellIndex][cellPara].text).length;
+    const sentinel = start >= length - 1 && end === length && this.sentinelActive;
+    if (sentinel && this.mode === 'ignore-tail') return '{}';
+    return super.setCharShapeIdInCell(section, parentPara, controlIndex, cellIndex, cellPara, start, end, sentinel && this.mode === 'wrong-id' ? 9 : id);
+  }
+  sentinelActive = false;
+  override replaceTextInCellDeferredPagination(...args: Parameters<FakeWasm['replaceTextInCellDeferredPagination']>) {
+    const [, , , , , , deleteCount, text] = args;
+    if (text === ' ' && deleteCount === 0) this.sentinelActive = true;
+    if (deleteCount === 1 && text === '') this.sentinelActive = false;
+    return super.replaceTextInCellDeferredPagination(...args);
+  }
+  override getCellCharPropertiesAt(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
+    const properties = super.getCellCharPropertiesAt(section, parentPara, controlIndex, cellIndex, cellPara, offset);
+    const length = Array.from(this.cells[cellIndex][cellPara].text).length;
+    if (this.mode === 'unreadable' && offset >= length && this.sentinelActive === false && this.armed) {
+      return { ...properties, charShapeId: undefined as unknown as number };
+    }
+    return properties;
+  }
+  armed = false;
 }
 
 function endShapeHarness(withSnapshotHook = false) {
@@ -1470,4 +1506,76 @@ test('새 세션 restore-exact에 endCharShapeId가 있으면 문단 끝 글자 
     expectedReplacementFormatSha256: beforeEvidence.formatSha256,
   });
   assert.deepEqual(cellShape(wasm), before);
+});
+
+function restoreExactWithEnd(controller: DocumentAgentController, wasm: FakeWasm, before: ReturnType<typeof cellShape>, beforeFormatSha256: string, commandId: string) {
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const state = controller.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  return controller.applyFieldCommand({
+    schemaVersion: 1,
+    commandId,
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({
+        length: paragraph.ids.length,
+        charShapeIds: paragraph.ids,
+        paraShapeId: paragraph.paraShapeId,
+        endCharShapeId: paragraph.end,
+      })),
+    },
+    expectedReplacementFormatSha256: beforeFormatSha256,
+  });
+}
+
+for (const mode of ['ignore-tail', 'wrong-id', 'unreadable'] as const) {
+  test(`문단 끝 글자 모양 사후 검증 실패(${mode})는 mutation 없이 TARGET_FORMAT_MISMATCH로 rollback한다`, async () => {
+    const wasm = new BrokenEndShapeWasm();
+    wasm.mode = mode;
+    const eventBus = new EventBus();
+    const input = new FakeInput(wasm, eventBus);
+    const controller = new DocumentAgentController({ wasm, input, eventBus, isDirty: () => true, render: async () => {} });
+    const first = cellParagraph('기존 첫 문단');
+    (first as EndCellParagraph).endCharShapeId = 21;
+    wasm.cells[1] = [first, cellParagraph('기존 둘째')];
+    const before = cellShape(wasm);
+    const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+    const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+    await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+    const appliedBytes = new TextDecoder().decode(wasm.exportHwp());
+    wasm.armed = true;
+    await assert.rejects(
+      restoreExactWithEnd(controller, wasm, before, beforeEvidence.formatSha256, `broken-${mode}`),
+      (error: unknown) => (error as { code?: string }).code === 'TARGET_FORMAT_MISMATCH',
+    );
+    assert.equal(new TextDecoder().decode(wasm.exportHwp()), appliedBytes, '문서는 반영 상태 그대로');
+    assert.equal(input.transactions, 1);
+  });
+}
+
+test('같은 세션 fallback에서도 끝 글자 모양 사후 검증 실패는 되돌리기 전체를 rollback한다', async () => {
+  const wasm = new BrokenEndShapeWasm();
+  const eventBus = new EventBus();
+  const input = new FakeInput(wasm, eventBus);
+  const controller = new DocumentAgentController({ wasm, input, eventBus, isDirty: () => true, render: async () => {} });
+  const first = cellParagraph('기존 첫 문단');
+  (first as EndCellParagraph).endCharShapeId = 21;
+  wasm.cells[1] = [first, cellParagraph('기존 둘째')];
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째'));
+  const appliedBytes = new TextDecoder().decode(wasm.exportHwp());
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string }).code === 'TARGET_FORMAT_MISMATCH',
+  );
+  assert.equal(new TextDecoder().decode(wasm.exportHwp()), appliedBytes);
+  assert.equal(input.transactions, 1);
 });

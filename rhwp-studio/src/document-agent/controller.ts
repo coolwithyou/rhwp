@@ -489,6 +489,30 @@ function replaceWholeTableCellRegion(
         applyActualInputStyleInCell(wasm, paragraphTarget, codePointLength(block));
       }
     }
+    // 문단 끝 글자 모양은 모든 split이 끝난 뒤 되살린다. split은 나눈 위치 뒤의 run을 앞
+    // 문단에서 떼어내므로, 문단마다 바로 되살리면 다음 split이 앞 문단 끝 run을 지운다.
+    // AI 본문 실제 입력 서식(actual-input) 반영은 바꾸지 않는다(복원 · 보존 경로만).
+    if (exactParagraphFormats && visualStyle === 'preserve') {
+      exactParagraphFormats.forEach((format, index) => {
+        if (format.endCharShapeId === undefined) return;
+        restoreCellParagraphEndCharShape(
+          wasm,
+          { ...target, kind: 'table_cell_text', cellParagraph: index },
+          codePointLength(blocks[index] ?? ''),
+          format.endCharShapeId,
+        );
+      });
+      // 한 문단의 보조 글자 삽입 · 삭제가 다른 문단을 바꾸지 않았는지 전체를 다시 확인한다.
+      exactParagraphFormats.forEach((format, index) => {
+        if (format.endCharShapeId === undefined) return;
+        assertCellParagraphEndCharShape(
+          wasm,
+          { ...target, kind: 'table_cell_text', cellParagraph: index },
+          codePointLength(blocks[index] ?? ''),
+          format.endCharShapeId,
+        );
+      });
+    }
     wasm.flushDeferredPagination?.();
     deferred = false;
     const lastIndex = Math.max(blocks.length - 1, 0);
@@ -551,9 +575,6 @@ function restoreRegionParagraphFormat(
     target.cellParagraph,
     exact?.paraShapeId ?? evidence.paraShapeId,
   );
-  if (exact?.endCharShapeId !== undefined) {
-    restoreCellParagraphEndCharShape(wasm, target, replacementLength, exact.endCharShapeId);
-  }
 }
 
 /** 문단 끝 위치(offset = length)의 글자 모양. core가 숫자를 주지 않으면 null. */
@@ -614,6 +635,27 @@ function restoreCellParagraphEndCharShape(
     : wasm.replaceTextInCellDeferredPagination(...at, 1, '');
   if (!deleted.ok) {
     throw new DocumentAgentError('TRANSACTION_FAILED', '문단 끝 글자 모양을 복원하지 못했습니다.');
+  }
+  assertCellParagraphEndCharShape(wasm, target, length, endCharShapeId);
+}
+
+/**
+ * endCharShapeId는 formatSha256(v1)에 들어가지 않으므로 별도 사후 조건으로 확인한다.
+ * 읽을 수 없거나 다르면(서식 지정이 무시된 경우 포함) 오류를 던져 snapshot 트랜잭션 전체를
+ * rollback한다.
+ */
+function assertCellParagraphEndCharShape(
+  wasm: DocumentAgentWasm,
+  target: RhwpTableCellTextTargetV1,
+  length: number,
+  endCharShapeId: number,
+): void {
+  const actual = cellParagraphEndCharShapeId(wasm, target, length);
+  if (actual !== endCharShapeId) {
+    throw new DocumentAgentError(
+      'TARGET_FORMAT_MISMATCH',
+      `문단 끝 글자 모양 복원을 확인하지 못했습니다(문단 ${target.cellParagraph}: 기대 ${endCharShapeId}, 실제 ${actual ?? '읽을 수 없음'}).`,
+    );
   }
 }
 
