@@ -1046,3 +1046,536 @@ test('field selection과 focus는 본문 누름틀의 exact fieldId를 노출하
   assert.equal(input.transactions, 0);
   assert.equal(events.length, 0);
 });
+
+// ── 5차: 같은 세션 field revert는 apply snapshot 명령의 before 스냅숏으로 정확히 복원한다 ──
+
+/**
+ * core 스냅숏과 "영역 교체가 되살리지 못하는 문단 끝 빈 run"을 흉내 내는 fake.
+ * trailingRun은 export bytes에만 나타나고 target evidence(text/format/context)에는 없다.
+ * 셀 텍스트를 교체하면 원래 값('11pt')을 잃는다 — 실제 core에서 끝 빈 run이 바뀌는 현상과 같은 모양.
+ */
+class SnapshotWasm extends FakeWasm {
+  trailingRun = '11pt';
+  snapshots = new Map<number, ReturnType<SnapshotWasm['cloneState']>>();
+  nextSnapshotId = 0;
+  restoreCalls: number[] = [];
+  cellTextWrites = 0;
+
+  override cloneState() {
+    return { ...super.cloneState(), trailingRun: this.trailingRun };
+  }
+  override restoreState(snapshot: ReturnType<FakeWasm['cloneState']> & { trailingRun?: string }) {
+    super.restoreState(snapshot);
+    if (snapshot.trailingRun !== undefined) this.trailingRun = snapshot.trailingRun;
+  }
+  saveSnapshot() {
+    const id = this.nextSnapshotId++;
+    this.snapshots.set(id, this.cloneState());
+    return id;
+  }
+  restoreSnapshot(id: number) {
+    const snapshot = this.snapshots.get(id);
+    if (!snapshot) throw new Error(`snapshot ${id} 없음`);
+    this.restoreCalls.push(id);
+    this.restoreState(structuredClone(snapshot));
+  }
+  discardSnapshot(id: number) { this.snapshots.delete(id); }
+  override replaceTextInCellDeferredPagination(...args: Parameters<FakeWasm['replaceTextInCellDeferredPagination']>) {
+    this.cellTextWrites += 1;
+    this.trailingRun = '10pt';
+    return super.replaceTextInCellDeferredPagination(...args);
+  }
+  override borrowDocumentHandle() {
+    const base = super.borrowDocumentHandle();
+    const tail = () => encoder.encode(`|trailing:${this.trailingRun}`);
+    const join = (head: Uint8Array) => {
+      const bytes = new Uint8Array(head.length + tail().length);
+      bytes.set(head);
+      bytes.set(tail(), head.length);
+      return bytes;
+    };
+    return { exportHwp: () => join(base.exportHwp()), exportHwpx: () => join(base.exportHwpx()) };
+  }
+}
+
+/** InputHandler + CommandHistory를 흉내 낸다: 성공한 snapshot 실행만 undo stack에 before id와 함께 쌓는다. */
+class SnapshotHistoryInput extends FakeInput {
+  undoStack: Array<{ type: string; beforeId: number | null; cursorBefore: ReturnType<FakeInput['getCursorPosition']> }> = [];
+  hookEnabled = true;
+  private snapWasm: SnapshotWasm;
+
+  constructor(wasm: SnapshotWasm, eventBus: EventBus) {
+    super(wasm, eventBus);
+    this.snapWasm = wasm;
+  }
+
+  override async executeDocumentAgentOperation(
+    desc: Parameters<DocumentAgentInput['executeDocumentAgentOperation']>[0],
+    render: () => Promise<void>,
+  ) {
+    const cursorBefore = this.getCursorPosition();
+    const beforeId = this.snapWasm.saveSnapshot();
+    const committedBefore = this.transactions;
+    try {
+      await super.executeDocumentAgentOperation(desc, render);
+    } catch (error) {
+      this.snapWasm.discardSnapshot(beforeId);
+      throw error;
+    }
+    if (this.transactions === committedBefore) {
+      this.snapWasm.discardSnapshot(beforeId);
+      return;
+    }
+    this.undoStack.push({ type: `snapshot:${desc.operationType}`, beforeId, cursorBefore });
+  }
+
+  documentAgentUndoSnapshot(operationType: string) {
+    if (!this.hookEnabled) return null;
+    const top = this.undoStack.at(-1);
+    if (!top || top.type !== `snapshot:${operationType}` || top.beforeId === null) return null;
+    return { snapshotId: top.beforeId, cursorBefore: { ...top.cursorBefore } };
+  }
+}
+
+function snapshotHarness(options: { render?: () => Promise<void> } = {}) {
+  const wasm = new SnapshotWasm();
+  const eventBus = new EventBus();
+  const input = new SnapshotHistoryInput(wasm, eventBus);
+  const events: unknown[] = [];
+  eventBus.on('document-agent-changed', (event) => events.push(event));
+  const controller = new DocumentAgentController({
+    wasm,
+    input,
+    eventBus,
+    isDirty: () => true,
+    render: options.render ?? (async () => {}),
+  });
+  wasm.cells[1] = [cellParagraph('기존 첫 문단'), cellParagraph('기존 둘째 문단')];
+  return { controller, wasm, input, events, eventBus };
+}
+
+function exportText(wasm: FakeWasm) {
+  return new TextDecoder().decode(wasm.exportHwp());
+}
+
+function revertOf(applied: Awaited<ReturnType<DocumentAgentController['applyFieldCommand']>>) {
+  return {
+    schemaVersion: 1 as const,
+    commandId: applied.commandId,
+    expectedDocumentEpoch: applied.documentEpoch,
+    expectedChangeSeq: applied.afterChangeSeq,
+    expectedAfterDocumentSha256: applied.afterDocumentSha256,
+    expectedAfterSha256: applied.afterTextSha256,
+  };
+}
+
+test('같은 세션 field revert는 apply 스냅숏으로 문단 끝 run까지 apply 전 bytes로 복원한다', async () => {
+  const { controller, wasm, input, events } = snapshotHarness();
+  const beforeBytes = exportText(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  assert.equal(wasm.trailingRun, '10pt');
+  const applySnapshotId = input.undoStack.at(-1)!.beforeId;
+  const writesBeforeRevert = wasm.cellTextWrites;
+
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, [applySnapshotId]);
+  assert.equal(wasm.cellTextWrites, writesBeforeRevert, 'snapshot 경로는 영역 교체를 하지 않는다');
+  assert.equal(exportText(wasm), beforeBytes);
+  assert.equal(wasm.trailingRun, '11pt');
+  assert.equal(reverted.afterDocumentSha256, applied.beforeDocumentSha256);
+  assert.equal(reverted.afterTextSha256, applied.beforeTextSha256);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+  assert.equal(events.length, 2);
+  assert.equal(input.undoStack.at(-1)!.type, 'snapshot:field-agent:revert');
+  // receipt 형식은 v1 그대로다(host 호환).
+  assert.deepEqual(Object.keys(reverted).sort(), Object.keys(applied).sort());
+  assert.deepEqual(await controller.revertFieldCommand(revertOf(applied)), reverted, 'replay는 같은 receipt');
+});
+
+test('hook이 없는 이전 host는 영역 교체로 되돌리고 스냅숏에만 있는 상태는 되살리지 못한다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  input.hookEnabled = false;
+  const beforeBytes = exportText(wasm);
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(wasm.trailingRun, '10pt');
+  assert.notEqual(exportText(wasm), beforeBytes);
+  assert.equal(reverted.afterTextSha256, applied.beforeTextSha256);
+  assert.equal(input.transactions, 2);
+});
+
+test('apply 스냅숏이 축출돼 hook이 null이면 영역 교체로 되돌린다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  input.undoStack.at(-1)!.beforeId = null; // history budget eviction → discard
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(input.transactions, 2);
+});
+
+test('core 스냅숏 복원이 실패하면 rollback 뒤 영역 교체로 한 번만 commit한다', async () => {
+  const { controller, wasm, input, events } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  wasm.snapshots.delete(input.undoStack.at(-1)!.beforeId!); // core가 무통보로 잃은 스냅숏
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+  assert.equal(events.length, 2);
+  assert.equal(input.undoStack.filter(entry => entry.type === 'snapshot:field-agent:revert').length, 1);
+});
+
+test('복원 bytes가 apply 전 문서 SHA와 다르면 스냅숏 결과를 버리고 영역 교체로 되돌린다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const before = structuredClone(wasm.cells);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const applySnapshot = wasm.snapshots.get(input.undoStack.at(-1)!.beforeId!)!;
+  applySnapshot.trailingRun = '다른 문서';
+  const reverted = await controller.revertFieldCommand(revertOf(applied));
+  assert.equal(wasm.restoreCalls.length, 1);
+  assert.notEqual(wasm.trailingRun, '다른 문서', '불일치 스냅숏 상태는 commit되지 않는다');
+  assert.deepEqual(wasm.cells, before);
+  assert.equal(reverted.beforeChangeSeq + 1, reverted.afterChangeSeq);
+  assert.equal(input.transactions, 2);
+});
+
+test('apply 뒤 다른 편집이 있으면 스냅숏 경로도 복원 없이 거부한다', async () => {
+  const { controller, wasm, input, eventBus } = snapshotHarness();
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  wasm.cells[0][0].text = '사용자 편집';
+  eventBus.emit('document-mutated', 'user-edit');
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string }).code === 'COMMAND_NOT_LATEST',
+  );
+  assert.deepEqual(wasm.restoreCalls, []);
+  assert.equal(input.transactions, 1);
+});
+
+test('다른 snapshot 명령이 undo top이면 apply 스냅숏을 쓰지 않는다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  // changeSeq를 바꾸지 않고 top만 바뀐 비정상 상태(방어 확인): hook은 null, 영역 교체로 간다.
+  input.undoStack.push({ type: 'snapshot:pasteInternal', beforeId: wasm.saveSnapshot(), cursorBefore: input.getCursorPosition() });
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(wasm.restoreCalls, []);
+});
+
+test('반복 apply→revert도 매번 apply 전 bytes로 돌아간다', async () => {
+  const { controller, wasm, input } = snapshotHarness();
+  const beforeBytes = exportText(wasm);
+  for (let round = 0; round < 3; round += 1) {
+    const command = { ...fieldRegionCommand(controller, wasm, `새 첫 문단 ${round}\n새 둘째 문단`), commandId: `region-${round}` };
+    const applied = await controller.applyFieldCommand(command);
+    await controller.revertFieldCommand(revertOf(applied));
+    assert.equal(exportText(wasm), beforeBytes, `round ${round}`);
+  }
+  assert.equal(wasm.restoreCalls.length, 3);
+  assert.equal(input.transactions, 6);
+});
+
+test('스냅숏 revert의 strict render 실패는 apply 상태로 복구하고 재시도할 수 있다', async () => {
+  let failRender = false;
+  const { controller, wasm, input } = snapshotHarness({
+    render: async () => { if (failRender) throw new Error('renderer unavailable'); },
+  });
+  const beforeBytes = exportText(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단'));
+  const appliedBytes = exportText(wasm);
+  failRender = true;
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string; recovered?: boolean }).code === 'RENDER_FAILED',
+  );
+  assert.equal(exportText(wasm), appliedBytes);
+  assert.equal(input.transactions, 1);
+  failRender = false;
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.equal(exportText(wasm), beforeBytes);
+});
+
+// ── 5차: 문단 끝 글자 모양(글 뒤 빈 run) 복원 ──
+
+type EndCellParagraph = CellParagraph & { endCharShapeId?: number };
+
+/**
+ * 실제 core처럼 문단 끝 위치(offset = 길이)의 글자 모양을 따로 갖는 fake.
+ * - 글이 빈 문단에 새 글을 넣으면 끝 모양이 driftEndId로 바뀐다(실제 core의 45 끝 run 재현)
+ * - 문단 끝까지 지우면 지운 첫 글자의 모양이 끝 모양으로 남는다
+ * - 끝에 넣은 글자는 끝 모양을 이어받는다
+ */
+class EndShapeWasm extends FakeWasm {
+  driftEndId = 45;
+  constructor() {
+    super();
+    this.charShapeProperties.set(21, { textColor: '#000000', italic: false });
+    this.charShapeProperties.set(45, { textColor: '#000000', italic: false });
+  }
+  private paragraphAt(cellIndex: number, cellPara: number) {
+    return this.cells[cellIndex][cellPara] as EndCellParagraph;
+  }
+  endOf(cellIndex: number, cellPara: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    return paragraph.endCharShapeId ?? paragraph.charShapeIds[Array.from(paragraph.text).length - 1] ?? paragraph.charShapeIds[0];
+  }
+  override getCellCharPropertiesAt(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const charShapeId = offset >= Array.from(paragraph.text).length
+      ? this.endOf(cellIndex, cellPara)
+      : paragraph.charShapeIds[offset]!;
+    return { charShapeId, ...this.charShapeProperties.get(charShapeId) };
+  }
+  override replaceTextInCellDeferredPagination(_section: number, _parentPara: number, _controlIndex: number, cellIndex: number, cellPara: number, offset: number, deleteCount: number, text: string) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const chars = Array.from(paragraph.text);
+    const length = chars.length;
+    const end = this.endOf(cellIndex, cellPara);
+    const ids = length === 0 ? [] : paragraph.charShapeIds.slice(0, length);
+    let nextEnd: number | undefined = paragraph.endCharShapeId;
+    if (deleteCount > 0 && offset + deleteCount === length) nextEnd = ids[offset];
+    const inserted = Array.from(text);
+    const insertedId = offset < length ? ids[offset]! : end;
+    chars.splice(offset, deleteCount, ...inserted);
+    ids.splice(offset, deleteCount, ...inserted.map(() => insertedId));
+    if (length - deleteCount === 0 && inserted.length > 0) nextEnd = this.driftEndId;
+    paragraph.text = chars.join('');
+    paragraph.charShapeIds = ids.length > 0 ? ids : [nextEnd ?? end];
+    if (nextEnd === undefined) delete paragraph.endCharShapeId;
+    else paragraph.endCharShapeId = nextEnd;
+    return { ok: true, charOffset: offset + inserted.length, paginationDeferred: true };
+  }
+  /** 실제 core처럼 나눈 위치 뒤 run(끝 run 포함)은 새 문단으로 가고 앞 문단 끝 run은 사라진다. */
+  override splitParagraphInCell(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, charOffset: number) {
+    const paragraph = this.paragraphAt(cellIndex, cellPara);
+    const end = paragraph.endCharShapeId;
+    const result = super.splitParagraphInCell(section, parentPara, controlIndex, cellIndex, cellPara, charOffset);
+    delete (this.cells[cellIndex][cellPara] as EndCellParagraph).endCharShapeId;
+    if (end !== undefined) (this.cells[cellIndex][cellPara + 1] as EndCellParagraph).endCharShapeId = end;
+    return result;
+  }
+}
+
+/** 문단 끝 위치(offset ≥ 길이) 서식 지정을 무시하거나 잘못 적용하거나 끝 위치를 못 읽는 core. */
+class BrokenEndShapeWasm extends EndShapeWasm {
+  mode: 'ignore-tail' | 'wrong-id' | 'unreadable' = 'ignore-tail';
+  override setCharShapeIdInCell(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, start: number, end: number, id: number) {
+    const length = Array.from(this.cells[cellIndex][cellPara].text).length;
+    const sentinel = start >= length - 1 && end === length && this.sentinelActive;
+    if (sentinel && this.mode === 'ignore-tail') return '{}';
+    return super.setCharShapeIdInCell(section, parentPara, controlIndex, cellIndex, cellPara, start, end, sentinel && this.mode === 'wrong-id' ? 9 : id);
+  }
+  sentinelActive = false;
+  override replaceTextInCellDeferredPagination(...args: Parameters<FakeWasm['replaceTextInCellDeferredPagination']>) {
+    const [, , , , , , deleteCount, text] = args;
+    if (text === ' ' && deleteCount === 0) this.sentinelActive = true;
+    if (deleteCount === 1 && text === '') this.sentinelActive = false;
+    return super.replaceTextInCellDeferredPagination(...args);
+  }
+  override getCellCharPropertiesAt(section: number, parentPara: number, controlIndex: number, cellIndex: number, cellPara: number, offset: number) {
+    const properties = super.getCellCharPropertiesAt(section, parentPara, controlIndex, cellIndex, cellPara, offset);
+    const length = Array.from(this.cells[cellIndex][cellPara].text).length;
+    if (this.mode === 'unreadable' && offset >= length && this.sentinelActive === false && this.armed) {
+      return { ...properties, charShapeId: undefined as unknown as number };
+    }
+    return properties;
+  }
+  armed = false;
+}
+
+function endShapeHarness(withSnapshotHook = false) {
+  const wasm = new EndShapeWasm();
+  const eventBus = new EventBus();
+  const input = withSnapshotHook ? null : new FakeInput(wasm, eventBus);
+  const controller = new DocumentAgentController({
+    wasm,
+    input: input!,
+    eventBus,
+    isDirty: () => true,
+    render: async () => {},
+  });
+  const first = cellParagraph('기존 첫 문단');
+  (first as EndCellParagraph).endCharShapeId = 21; // 글 뒤 빈 run 11pt
+  const second = cellParagraph('기존 둘째');
+  wasm.cells[1] = [first, second];
+  return { controller, wasm, input: input!, eventBus };
+}
+
+function cellShape(wasm: EndShapeWasm) {
+  return wasm.cells[1].map((paragraph, index) => ({
+    text: paragraph.text,
+    ids: paragraph.charShapeIds.slice(0, Array.from(paragraph.text).length),
+    paraShapeId: paragraph.paraShapeId,
+    end: wasm.endOf(1, index),
+  }));
+}
+
+test('영역 evidence는 문단 끝 글자 모양을 담지만 v1 formatSha256은 바꾸지 않는다', () => {
+  const { wasm } = endShapeHarness();
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const evidence = collectFieldTargetEvidence(wasm, target);
+  assert.deepEqual(evidence.regionParagraphFormats?.map(format => format.endCharShapeId), [21, 7]);
+  (wasm.cells[1][0] as EndCellParagraph).endCharShapeId = 45;
+  assert.equal(collectFieldTargetEvidence(wasm, target).formatSha256, evidence.formatSha256);
+});
+
+test('스냅숏 없이 영역 교체로 되돌려도 문단 끝 글자 모양까지 반영 전과 같다', async () => {
+  const { controller, wasm, input } = endShapeHarness();
+  const before = cellShape(wasm);
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째 문단\n셋째'));
+  assert.notEqual(wasm.endOf(1, 0), 21);
+  await controller.revertFieldCommand(revertOf(applied));
+  assert.deepEqual(cellShape(wasm), before);
+  assert.equal(input.transactions, 2);
+});
+
+test('끝 모양 정보가 없는 restore-exact(이전 host 계약)는 글 · 글자 모양만 맞고 끝 모양은 부분 복원이다', async () => {
+  const { controller, wasm } = endShapeHarness();
+  const before = cellShape(wasm);
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+  const state = controller.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand({
+    schemaVersion: 1,
+    commandId: 'restore-without-end',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({ length: paragraph.ids.length, charShapeIds: paragraph.ids, paraShapeId: paragraph.paraShapeId })),
+    },
+    expectedReplacementFormatSha256: beforeEvidence.formatSha256,
+  });
+  const after = cellShape(wasm);
+  assert.deepEqual(after.map(({ end: _end, ...rest }) => rest), before.map(({ end: _end, ...rest }) => rest));
+  assert.notEqual(after[0]!.end, 21, '끝 모양 정보가 없으면 되살리지 못한다(새 세션 제한)');
+});
+
+test('새 세션 restore-exact에 endCharShapeId가 있으면 문단 끝 글자 모양까지 되살린다', async () => {
+  const { controller, wasm } = endShapeHarness();
+  const before = cellShape(wasm);
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+  await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+  const reloadedBus = new EventBus();
+  const reloaded = new DocumentAgentController({
+    wasm,
+    input: new FakeInput(wasm, reloadedBus),
+    eventBus: reloadedBus,
+    isDirty: () => true,
+    render: async () => {},
+  });
+  const state = reloaded.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  await reloaded.applyFieldCommand({
+    schemaVersion: 1,
+    commandId: 'restore-with-end',
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({
+        length: paragraph.ids.length,
+        charShapeIds: paragraph.ids,
+        paraShapeId: paragraph.paraShapeId,
+        endCharShapeId: paragraph.end,
+      })),
+    },
+    expectedReplacementFormatSha256: beforeEvidence.formatSha256,
+  });
+  assert.deepEqual(cellShape(wasm), before);
+});
+
+function restoreExactWithEnd(controller: DocumentAgentController, wasm: FakeWasm, before: ReturnType<typeof cellShape>, beforeFormatSha256: string, commandId: string) {
+  const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+  const state = controller.getDocumentState();
+  const current = collectFieldTargetEvidence(wasm, target);
+  return controller.applyFieldCommand({
+    schemaVersion: 1,
+    commandId,
+    expectedDocumentEpoch: state.documentEpoch,
+    expectedChangeSeq: state.changeSeq,
+    expectedDocumentSha256: state.documentSha256,
+    target,
+    expectedBeforeSha256: current.textSha256,
+    expectedFormatSha256: current.formatSha256,
+    expectedAdjacentContextSha256: current.adjacentContextSha256,
+    replacement: before.map(paragraph => paragraph.text).join('\n'),
+    replacementStyle: 'restore-exact',
+    replacementFormat: {
+      kind: 'table_cell_region',
+      paragraphs: before.map(paragraph => ({
+        length: paragraph.ids.length,
+        charShapeIds: paragraph.ids,
+        paraShapeId: paragraph.paraShapeId,
+        endCharShapeId: paragraph.end,
+      })),
+    },
+    expectedReplacementFormatSha256: beforeFormatSha256,
+  });
+}
+
+for (const mode of ['ignore-tail', 'wrong-id', 'unreadable'] as const) {
+  test(`문단 끝 글자 모양 사후 검증 실패(${mode})는 mutation 없이 TARGET_FORMAT_MISMATCH로 rollback한다`, async () => {
+    const wasm = new BrokenEndShapeWasm();
+    wasm.mode = mode;
+    const eventBus = new EventBus();
+    const input = new FakeInput(wasm, eventBus);
+    const controller = new DocumentAgentController({ wasm, input, eventBus, isDirty: () => true, render: async () => {} });
+    const first = cellParagraph('기존 첫 문단');
+    (first as EndCellParagraph).endCharShapeId = 21;
+    wasm.cells[1] = [first, cellParagraph('기존 둘째')];
+    const before = cellShape(wasm);
+    const target = { kind: 'table_cell_region' as const, section: 0, parentPara: 1, controlIndex: 0, cellIndex: 1 };
+    const beforeEvidence = collectFieldTargetEvidence(wasm, target);
+    await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단'));
+    const appliedBytes = new TextDecoder().decode(wasm.exportHwp());
+    wasm.armed = true;
+    await assert.rejects(
+      restoreExactWithEnd(controller, wasm, before, beforeEvidence.formatSha256, `broken-${mode}`),
+      (error: unknown) => (error as { code?: string }).code === 'TARGET_FORMAT_MISMATCH',
+    );
+    assert.equal(new TextDecoder().decode(wasm.exportHwp()), appliedBytes, '문서는 반영 상태 그대로');
+    assert.equal(input.transactions, 1);
+  });
+}
+
+test('같은 세션 fallback에서도 끝 글자 모양 사후 검증 실패는 되돌리기 전체를 rollback한다', async () => {
+  const wasm = new BrokenEndShapeWasm();
+  const eventBus = new EventBus();
+  const input = new FakeInput(wasm, eventBus);
+  const controller = new DocumentAgentController({ wasm, input, eventBus, isDirty: () => true, render: async () => {} });
+  const first = cellParagraph('기존 첫 문단');
+  (first as EndCellParagraph).endCharShapeId = 21;
+  wasm.cells[1] = [first, cellParagraph('기존 둘째')];
+  const applied = await controller.applyFieldCommand(fieldRegionCommand(controller, wasm, '새 첫 문단\n새 둘째'));
+  const appliedBytes = new TextDecoder().decode(wasm.exportHwp());
+  await assert.rejects(
+    controller.revertFieldCommand(revertOf(applied)),
+    (error: unknown) => (error as { code?: string }).code === 'TARGET_FORMAT_MISMATCH',
+  );
+  assert.equal(new TextDecoder().decode(wasm.exportHwp()), appliedBytes);
+  assert.equal(input.transactions, 1);
+});

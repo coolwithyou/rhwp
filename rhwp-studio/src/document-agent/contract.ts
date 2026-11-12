@@ -140,9 +140,21 @@ function parseFieldRestoreFormat(value: unknown, target: RhwpFieldTargetV1): Rhw
     }
     const paragraphs = format.paragraphs.map((value, index) => {
       const paragraph = record(value, `replacementFormat.paragraphs[${index}]`);
-      exactKeys(paragraph, ['length', 'charShapeIds', 'paraShapeId'], `replacementFormat.paragraphs[${index}]`);
+      exactKeys(
+        paragraph,
+        [
+          'length',
+          'charShapeIds',
+          'paraShapeId',
+          ...(paragraph.endCharShapeId === undefined ? [] : ['endCharShapeId']),
+        ],
+        `replacementFormat.paragraphs[${index}]`,
+      );
       safeInteger(paragraph.length, 0, `replacementFormat.paragraphs[${index}].length`);
       safeInteger(paragraph.paraShapeId, 0, `replacementFormat.paragraphs[${index}].paraShapeId`);
+      if (paragraph.endCharShapeId !== undefined) {
+        safeInteger(paragraph.endCharShapeId, 0, `replacementFormat.paragraphs[${index}].endCharShapeId`);
+      }
       return {
         length: paragraph.length,
         charShapeIds: restoreCharShapeIds(
@@ -150,6 +162,9 @@ function parseFieldRestoreFormat(value: unknown, target: RhwpFieldTargetV1): Rhw
           `replacementFormat.paragraphs[${index}].charShapeIds`,
         ),
         paraShapeId: paragraph.paraShapeId,
+        ...(paragraph.endCharShapeId === undefined
+          ? {}
+          : { endCharShapeId: paragraph.endCharShapeId as number }),
       };
     });
     return { kind: 'table_cell_region', paragraphs };

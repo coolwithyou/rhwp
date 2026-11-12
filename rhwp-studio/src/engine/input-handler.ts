@@ -2742,6 +2742,21 @@ export class InputHandler {
   }
 
   /**
+   * document-agent 같은 세션 정확 되돌리기용: undo top이 지정한 종류의 document-agent
+   * SnapshotCommand이고 before 스냅숏을 아직 들고 있을 때만 그 id와 실행 전 커서를 준다.
+   * 그 밖(다른 편집이 위에 쌓임, 예산 축출로 discard, Undo로 내려감)은 null.
+   */
+  documentAgentUndoSnapshot(
+    operationType: string,
+  ): { snapshotId: number; cursorBefore: DocumentPosition } | null {
+    const top = this.history.peekUndoTop();
+    if (!(top instanceof SnapshotCommand) || top.type !== `snapshot:${operationType}`) return null;
+    const snapshotId = top.beforeSnapshotId();
+    if (snapshotId === null) return null;
+    return { snapshotId, cursorBefore: top.cursorBeforePosition() };
+  }
+
+  /**
    * document-agent 전용 two-phase snapshot 경로.
    *
    * 기존 executeOperation은 history commit 직후 document event로 비동기 render를 예약한다.

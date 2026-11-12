@@ -1927,6 +1927,8 @@ pub(crate) fn layout_paragraph_in_frame(
         .first()
         .map(|segment| segment.tag)
         .unwrap_or(LineSeg::TAG_IMPLEMENTATION_PROPERTY | LineSeg::TAG_SINGLE_SEGMENT_LINE);
+    // 마지막 줄은 문단 끝 표시(글 뒤 빈 run 포함)의 크기까지 줄 높이에 넣는다(scalar 경로와 같음).
+    let paragraph_end_font_size = paragraph_end_font_size(para, styles).unwrap_or(0.0);
     let first_row = frame.row_count();
     let frame_checkpoint = frame.clone();
     let mut cursor = FillCursor::new(0, true);
@@ -1988,6 +1990,9 @@ pub(crate) fn layout_paragraph_in_frame(
                     )?;
                     let line = &filled.line;
                     maximum_font_size = maximum_font_size.max(line.max_font_size);
+                    if line.end_idx == text_chars.len() {
+                        maximum_font_size = maximum_font_size.max(paragraph_end_font_size);
+                    }
                     for control in inline_controls.iter().filter(|control| {
                         (line.start_idx..line.end_idx).contains(&control.char_position)
                             || (line.end_idx == text_chars.len()
@@ -2540,14 +2545,23 @@ fn reflow_line_segs_impl(
         .flatten();
     let preserved_prefix_len = preserved_prefix.len();
     let mut new_line_segs: Vec<LineSeg> = preserved_prefix;
+    // 문단 끝 표시는 마지막 글자 모양 구간(글 뒤의 빈 run 포함)의 크기를 가진다. 한컴은 마지막
+    // 줄의 높이 · 기준선 · 줄 간격을 이 크기까지 포함한 최대 글자 크기로 저장한다.
+    let paragraph_end_font_size = paragraph_end_font_size(para, styles);
+    let last_line_idx = line_breaks.len().saturating_sub(1);
     for (line_idx, lb) in line_breaks.iter().enumerate() {
         let utf16_start = if new_line_segs.is_empty() {
             0 // 첫 번째 줄의 text_start는 항상 0 (문단 시작)
         } else {
             char_index_to_utf16_offset(para, lb.start_idx)
         };
-        let fs = if lb.max_font_size > 0.0 {
-            lb.max_font_size
+        let end_mark_fs = if line_idx == last_line_idx && lb.end_idx == text_len {
+            paragraph_end_font_size.unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let fs = if lb.max_font_size.max(end_mark_fs) > 0.0 {
+            lb.max_font_size.max(end_mark_fs)
         } else {
             12.0
         };
@@ -2822,6 +2836,16 @@ pub(crate) fn paragraph_flow_end(para: &Paragraph) -> Option<i32> {
 /// font_size(px)를 LineSeg의 line_height(HWPUNIT)로 변환한다.
 /// HWP의 LineSeg.line_height = 폰트 크기 (HWPUNIT).
 /// 실증 데이터: 10pt → lh=1000, 12pt → lh=1200, 25pt → lh=2500
+/// 문단 끝 표시의 글자 크기: 마지막 글자 모양 구간(글 뒤 빈 run이면 그 run)의 크기.
+fn paragraph_end_font_size(para: &Paragraph, styles: &ResolvedStyleSet) -> Option<f64> {
+    let char_shape = para.char_shapes.last()?;
+    styles
+        .char_styles
+        .get(char_shape.char_shape_id as usize)
+        .map(|style| style.font_size)
+        .filter(|size| *size > 0.0)
+}
+
 fn font_size_to_line_height(font_size_px: f64, dpi: f64) -> i32 {
     px_to_hwpunit(font_size_px, dpi)
 }

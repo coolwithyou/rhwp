@@ -302,7 +302,34 @@ export interface RhwpApplyFieldCommandV1 {
   expectedFormatSha256: string;
   expectedAdjacentContextSha256: string;
   replacement: string;
+  /** AI 본문, 현재 서식 유지, 서버가 봉인한 원래 서식 복원을 구분한다. */
+  replacementStyle?: 'actual-input' | 'preserve' | 'restore-exact';
+  replacementFormat?: RhwpFieldRestoreFormatV1;
+  expectedReplacementFormatSha256?: string;
 }
+
+export type RhwpFieldRestoreFormatV1 =
+  | {
+      kind: 'table_cell_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+    }
+  | {
+      kind: 'table_cell_region';
+      paragraphs: Array<{
+        length: number;
+        charShapeIds: number[];
+        paraShapeId: number;
+        /** 선택: 문단 끝 글자 모양. Studio가 `field-end-char-shape-v1`을 광고할 때만 보낸다. */
+        endCharShapeId?: number;
+      }>;
+    }
+  | {
+      kind: 'form_text';
+      charShapeIds: number[];
+      paraShapeId: number;
+      styleId: number;
+    };
 
 export type RhwpRevertFieldCommandV1 = RhwpRevertTextCommandV1;
 
@@ -401,6 +428,8 @@ export declare class RhwpEditor {
   focusFieldTarget(target: RhwpFieldTargetV1): Promise<{ focused: boolean; page: number }>;
   /** exact table cell field를 한 트랜잭션으로 교체 */
   applyFieldCommand(command: RhwpApplyFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
+  /** restore-exact 영역 문단의 endCharShapeId를 Studio가 받는지(`field-end-char-shape-v1`) */
+  supportsFieldEndCharShape(): boolean;
   /** 가장 최근 exact field command를 한 트랜잭션으로 되돌림 */
   revertFieldCommand(command: RhwpRevertFieldCommandV1): Promise<RhwpFieldCommandReceiptV1>;
   /** agent apply/revert가 commit된 뒤 strict v1 변경 이벤트 구독 */
